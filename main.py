@@ -53,6 +53,18 @@ async def main():
         except Exception as e:
             logger.warning("Could not start web health check server: %s", e)
 
+    # Clear any stale webhooks to ensure Telegram delivers updates via MTProto
+    try:
+        import urllib.request
+        import json
+        webhook_del_url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/deleteWebhook"
+        req = urllib.request.Request(webhook_del_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            logger.info("Telegram webhook status reset: %s", data.get("description", "OK"))
+    except Exception as e:
+        logger.debug("Webhook reset check: %s", e)
+
     # 3. Start Pyrogram MTProto Bot Client
     logger.info("Connecting Telegram Bot client...")
     await app.start()
