@@ -30,6 +30,25 @@ MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "8"
 BUFFER_SIZE = int(os.getenv("BUFFER_SIZE", str(1024 * 1024)))  # 1 MB I/O buffer
 HTTP_CHUNK_SIZE = int(os.getenv("HTTP_CHUNK_SIZE", str(10 * 1024 * 1024)))  # 10 MB HTTP chunks
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt" if os.path.exists("cookies.txt") else "")
+COOKIES_DATA = os.getenv("COOKIES_DATA", os.getenv("YOUTUBE_COOKIES", ""))
+
+# Auto-generate cookies.txt from environment variable (supports raw text or base64)
+if COOKIES_DATA:
+    try:
+        import base64
+        _raw = COOKIES_DATA.strip()
+        if "\\n" in _raw and "\n" not in _raw:
+            _raw = _raw.replace("\\n", "\n")
+        if not (_raw.startswith("# Netscape") or "\t" in _raw):
+            try:
+                _raw = base64.b64decode(_raw).decode("utf-8")
+            except Exception:
+                pass
+        with open("cookies.txt", "w", encoding="utf-8") as _f:
+            _f.write(_raw)
+        COOKIES_FILE = "cookies.txt"
+    except Exception as _e:
+        pass
 
 # Check if aria2c external downloader is available on system
 ARIA2C_AVAILABLE = bool(shutil.which("aria2c"))
