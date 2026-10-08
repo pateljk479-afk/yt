@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Temporary media & sessions
+downloads/
+*.session
+*.session-journal
+*.log
+
+# Environment & credentials
+.env
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

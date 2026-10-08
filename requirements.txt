@@ -1,0 +1,15 @@
+# Telegram MTProto Client & Cryptographic Acceleration
+pyrogram>=2.0.106
+tgcrypto>=1.2.5
+
+# YouTube & Media Processing
+yt-dlp>=2024.0.0
+pillow>=10.0.0
+
+# Asynchronous HTTP & Cloud Health Check
+aiohttp>=3.9.0
+python-dotenv>=1.0.0
+
+# Testing & Verification
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
