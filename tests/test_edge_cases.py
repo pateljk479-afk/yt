@@ -116,3 +116,43 @@ def test_config_validation():
         config.BOT_TOKEN = original_bot_token
         config.API_ID = original_api_id
         config.API_HASH = original_api_hash
+
+
+def test_max_concurrent_transmissions_config():
+    assert hasattr(config, "MAX_CONCURRENT_TRANSMISSIONS")
+    assert config.MAX_CONCURRENT_TRANSMISSIONS >= 1
+
+
+@pytest.mark.asyncio
+async def test_playlist_batch_failure_tracking():
+    """Verify that failed playlist downloads are accurately counted as failures."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from bot import process_playlist_downloads
+
+    mock_client = MagicMock()
+    mock_client.send_message = AsyncMock(return_value=MagicMock())
+    
+    mock_status_msg = MagicMock()
+    mock_status_msg.edit_text = AsyncMock()
+
+    entries = [
+        {"title": "Video 1 Success", "url": "https://youtube.com/watch?v=good1"},
+        {"title": "Video 2 Fail", "url": "https://youtube.com/watch?v=bad2"},
+    ]
+
+    # Patch process_single_download to return True for first, False for second
+    side_effects = [True, False]
+    with patch("bot.process_single_download", AsyncMock(side_effect=side_effects)):
+        await process_playlist_downloads(
+            client=mock_client,
+            status_msg=mock_status_msg,
+            chat_id=12345,
+            entries=entries,
+            quality_key="max",
+        )
+
+    # Check that final summary reflects 1 succeeded, 1 failed
+    assert mock_status_msg.edit_text.call_count >= 1
+    final_call = mock_status_msg.edit_text.call_args[0][0]
+    assert "Successfully sent:</b> 1 / 2" in final_call
+    assert "Failed items:</b> 1" in final_call

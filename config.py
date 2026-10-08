@@ -26,8 +26,10 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # Configured for high bandwidth (600 Mbps) & multi-core CPU (4 cores, 1.5 GHz, 2 GB RAM)
 CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "16"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "8"))
 BUFFER_SIZE = int(os.getenv("BUFFER_SIZE", str(1024 * 1024)))  # 1 MB I/O buffer
 HTTP_CHUNK_SIZE = int(os.getenv("HTTP_CHUNK_SIZE", str(10 * 1024 * 1024)))  # 10 MB HTTP chunks
+COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt" if os.path.exists("cookies.txt") else "")
 
 # Check if aria2c external downloader is available on system
 ARIA2C_AVAILABLE = bool(shutil.which("aria2c"))

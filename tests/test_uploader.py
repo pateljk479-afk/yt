@@ -58,6 +58,12 @@ def test_verify_media_integrity():
             f.write(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 2040)
         assert not verify_media_integrity(corrupt_file)
 
+        # 3b. File without ftyp atom should immediately fail
+        no_ftyp_file = os.path.join(tmpdir, "no_ftyp.mp4")
+        with open(no_ftyp_file, "wb") as f:
+            f.write(b"\x00" * 2048)
+        assert not verify_media_integrity(no_ftyp_file)
+
         # 4. Real valid MP4 container
         valid_file = os.path.join(tmpdir, "valid.mp4")
         import subprocess

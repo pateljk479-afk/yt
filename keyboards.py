@@ -57,11 +57,16 @@ def build_playlist_keyboard(session: PlaylistSession) -> InlineKeyboardMarkup:
     ]
     keyboard.append(batch_row)
 
-    # 4. Action row: [📥 Download Selected (N)] [❌ Cancel]
+    # 4. Action row: [📥 Download Selected/All (N)] [❌ Cancel]
     selected_count = len(session.selected_indices)
+    download_label = (
+        f"📥 Download All ({selected_count})"
+        if selected_count == session.total_entries and session.total_entries > 0
+        else f"📥 Download Selected ({selected_count})"
+    )
     action_row = [
         InlineKeyboardButton(
-            f"📥 Download Selected ({selected_count})",
+            download_label,
             callback_data=f"pl_dl:{session.session_id}",
         ),
         InlineKeyboardButton("❌ Cancel", callback_data=f"pl_cancel:{session.session_id}"),
@@ -76,7 +81,7 @@ def build_playlist_quality_keyboard(session_id: str) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton(
-                "⭐ Max Quality (Best <= 2GB)",
+                "⭐ Max Quality / High Quality (Best <= 2GB)",
                 callback_data=f"pl_q:{session_id}:max",
             )
         ],
@@ -103,7 +108,7 @@ def build_video_quality_keyboard(session: VideoSession) -> InlineKeyboardMarkup:
     """
     Build quality selection keyboard for a single YouTube video.
     Strictly shows only qualities <= 2GB.
-    Features 'Max Quality' button at top picking highest quality under 2GB limit.
+    Features 'Max Quality / High Quality' button at top picking highest quality under 2GB limit.
     """
     keyboard: List[List[InlineKeyboardButton]] = []
     analysis = session.analysis
@@ -113,7 +118,7 @@ def build_video_quality_keyboard(session: VideoSession) -> InlineKeyboardMarkup:
         max_q = analysis.max_quality
         size_str = human_readable_size(max_q.estimated_size)
         top_btn = InlineKeyboardButton(
-            f"⭐ Max Quality ({max_q.label} ~ {size_str})",
+            f"⭐ Max Quality / High Quality ({max_q.label} ~ {size_str})",
             callback_data=f"vid:{session.session_id}:max",
         )
         keyboard.append([top_btn])

@@ -134,3 +134,51 @@ def test_build_ydl_options():
     assert opts["concurrent_fragment_downloads"] == config.CONCURRENT_FRAGMENT_DOWNLOADS
     assert opts["writethumbnail"] is True
     assert opts["postprocessor_args"] == {"ffmpeg": ["-movflags", "+faststart"]}
+    assert "extractor_args" in opts
+    assert "android" in opts["extractor_args"]["youtube"]["player_client"]
+
+
+def test_download_media_quality_degradation_logic():
+    """Verify format selection logic degrades when requested height exceeds 2 GB."""
+    from unittest.mock import patch, MagicMock
+    from downloader import download_media
+
+    size_4k = int(2.4 * 1024 * 1024 * 1024)  # 2.4 GB (> 2GB)
+    size_2k = int(1.5 * 1024 * 1024 * 1024)  # 1.5 GB (<= 2GB)
+
+    mock_info = {
+        "title": "Super 4K Nature",
+        "id": "mock4k",
+        "duration": 600,
+        "thumbnail": "https://example.com/thumb.jpg",
+        "formats": [
+            {"vcodec": "none", "acodec": "mp4a.4", "filesize": 20 * 1024 * 1024},
+            {"height": 2160, "vcodec": "vp9", "acodec": "none", "filesize": size_4k},
+            {"height": 1440, "vcodec": "vp9", "acodec": "none", "filesize": size_2k},
+            {"height": 1080, "vcodec": "avc1", "acodec": "none", "filesize": 700 * 1024 * 1024},
+        ],
+    }
+
+    # Patch extract_info to return mock_info
+    with patch("downloader.extract_info", return_value=mock_info), \
+         patch("yt_dlp.YoutubeDL") as mock_ydl_cls, \
+         patch("os.listdir") as mock_listdir, \
+         patch("os.path.exists", return_value=True), \
+         patch("os.path.getsize", return_value=1500 * 1024 * 1024):
+
+        mock_ydl_instance = MagicMock()
+        mock_ydl_instance.extract_info.return_value = {
+            "title": "Super 4K Nature",
+            "duration": 600,
+            "width": 2560,
+            "height": 1440,
+        }
+        mock_ydl_cls.return_value.__enter__.return_value = mock_ydl_instance
+        mock_listdir.return_value = ["Super 4K Nature.mp4", "Super 4K Nature.webp"]
+
+        # Request 4K (2160), which exceeds 2 GB: should degrade to 1440 (2K)
+        res = download_media("https://youtube.com/watch?v=mock4k", quality_key="2160")
+        assert res.title == "Super 4K Nature"
+        # Verify ydl was invoked with degraded format <= 1440
+        ydl_call_args = mock_ydl_cls.call_args[0][0]
+        assert "height<=1440" in ydl_call_args["format"]

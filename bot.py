@@ -44,17 +44,21 @@ app = Client(
     api_hash=config.API_HASH if config.API_HASH else "placeholder_hash",
     bot_token=config.BOT_TOKEN if config.BOT_TOKEN else "placeholder_token",
     workers=16,
+    max_concurrent_transmissions=config.MAX_CONCURRENT_TRANSMISSIONS,
 )
 
 
 class ThrottledProgressUpdater:
-    """Helper to throttle Telegram message edits to avoid FloodWait."""
+    """Helper to throttle Telegram message edits to avoid FloodWait and compute real transfer speed."""
 
     def __init__(self, message: Message, stage: str = "Downloading", interval: float = config.PROGRESS_UPDATE_INTERVAL):
         self.message = message
         self.stage = stage
         self.interval = interval
         self.last_update_time = 0.0
+        self.start_upload_time = 0.0
+        self.last_upload_bytes = 0
+        self.last_upload_time = 0.0
         self.loop = asyncio.get_event_loop()
 
     def sync_hook(self, d: dict):
@@ -72,13 +76,21 @@ class ThrottledProgressUpdater:
                 asyncio.run_coroutine_threadsafe(self._safe_edit(text), self.loop)
 
     async def async_upload_hook(self, current: int, total: int):
-        """Pyrogram upload progress callback."""
+        """Pyrogram upload progress callback with real speed & ETA calculation."""
         now = time.time()
-        if now - self.last_update_time >= self.interval or current == total:
-            self.last_update_time = now
-            # Estimate upload speed
-            speed = 0  # Pyrogram progress doesn't provide speed directly
-            text = format_progress_bar(current, total, speed, 0, stage=self.stage)
+        if self.start_upload_time == 0.0:
+            self.start_upload_time = now
+            self.last_upload_time = now
+            self.last_upload_bytes = current
+
+        dt = now - self.last_upload_time
+        if dt >= self.interval or current == total:
+            delta_bytes = current - self.last_upload_bytes
+            speed = delta_bytes / dt if dt > 0 else 0
+            eta = int((total - current) / speed) if speed > 0 and total > current else 0
+            self.last_upload_time = now
+            self.last_upload_bytes = current
+            text = format_progress_bar(current, total, speed, eta, stage=self.stage)
             await self._safe_edit(text)
 
     async def _safe_edit(self, text: str):
@@ -152,10 +164,39 @@ async def help_command(client: Client, message: Message):
     await message.reply_text(help_text)
 
 
+def format_playlist_caption(session: PlaylistSession) -> str:
+    """Format rich playlist page view showing up to 10 videos with full titles and checkmarks."""
+    start = session.page * session.per_page
+    end = min(start + session.per_page, session.total_entries)
+    page_entries = session.get_page_entries()
+
+    text = (
+        f"📋 <b>Playlist:</b> {session.playlist_title}\n"
+        f"📊 <b>Total Videos:</b> {session.total_entries} | <b>Selected:</b> {len(session.selected_indices)}\n"
+        f"📄 <b>Page:</b> {session.page + 1} / {session.total_pages} (Items {start + 1}–{end})\n\n"
+        f"<b>Videos on this page:</b>\n"
+    )
+
+    for idx, entry in page_entries:
+        is_sel = idx in session.selected_indices
+        check = "✅" if is_sel else "⬜"
+        title = entry.get("title", f"Video {idx + 1}")
+        if len(title) > 42:
+            title = title[:39] + "..."
+        text += f"{check} <b>{idx + 1}.</b> {title}\n"
+
+    text += "\n<i>Click items below to toggle, or click 'Select All':</i>"
+    return text
+
+
 @app.on_message(filters.command("video"))
 async def video_command(client: Client, message: Message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
+        if message.reply_to_message and message.reply_to_message.text:
+            url = message.reply_to_message.text.strip()
+            await handle_video_request(client, message, url)
+            return
         await message.reply_text("⚠️ <b>Please provide a YouTube video URL:</b>\n<code>/video https://youtu.be/...</code>")
         return
     url = parts[1].strip()
@@ -166,6 +207,10 @@ async def video_command(client: Client, message: Message):
 async def playlist_command(client: Client, message: Message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
+        if message.reply_to_message and message.reply_to_message.text:
+            url = message.reply_to_message.text.strip()
+            await handle_playlist_request(client, message, url)
+            return
         await message.reply_text("⚠️ <b>Please provide a YouTube playlist URL:</b>\n<code>/playlist https://youtube.com/playlist?list=...</code>")
         return
     url = parts[1].strip()
@@ -244,13 +289,7 @@ async def handle_playlist_request(client: Client, message: Message, url: str):
             message_id=status_msg.id,
         )
 
-        caption = (
-            f"📋 <b>Playlist:</b> {title}\n"
-            f"📊 <b>Total Videos:</b> {session.total_entries} | <b>Selected:</b> 0\n"
-            f"📄 <b>Page:</b> 1 / {session.total_pages}\n\n"
-            f"<i>Click items to toggle, or click 'Select All' below:</i>"
-        )
-
+        caption = format_playlist_caption(session)
         keyboard = build_playlist_keyboard(session)
         await status_msg.edit_text(caption, reply_markup=keyboard)
 
@@ -295,12 +334,7 @@ async def callback_pl_toggle(client: Client, callback: CallbackQuery):
 
     session.toggle(index)
     keyboard = build_playlist_keyboard(session)
-    caption = (
-        f"📋 <b>Playlist:</b> {session.playlist_title}\n"
-        f"📊 <b>Total Videos:</b> {session.total_entries} | <b>Selected:</b> {len(session.selected_indices)}\n"
-        f"📄 <b>Page:</b> {session.page + 1} / {session.total_pages}\n\n"
-        f"<i>Click items to toggle, or click 'Select All' below:</i>"
-    )
+    caption = format_playlist_caption(session)
     try:
         await callback.message.edit_text(caption, reply_markup=keyboard)
     except MessageNotModified:
@@ -319,12 +353,7 @@ async def callback_pl_page(client: Client, callback: CallbackQuery):
 
     session.page = max(0, min(page, session.total_pages - 1))
     keyboard = build_playlist_keyboard(session)
-    caption = (
-        f"📋 <b>Playlist:</b> {session.playlist_title}\n"
-        f"📊 <b>Total Videos:</b> {session.total_entries} | <b>Selected:</b> {len(session.selected_indices)}\n"
-        f"📄 <b>Page:</b> {session.page + 1} / {session.total_pages}\n\n"
-        f"<i>Click items to toggle, or click 'Select All' below:</i>"
-    )
+    caption = format_playlist_caption(session)
     try:
         await callback.message.edit_text(caption, reply_markup=keyboard)
     except MessageNotModified:
@@ -342,12 +371,7 @@ async def callback_pl_all(client: Client, callback: CallbackQuery):
 
     session.select_all()
     keyboard = build_playlist_keyboard(session)
-    caption = (
-        f"📋 <b>Playlist:</b> {session.playlist_title}\n"
-        f"📊 <b>Total Videos:</b> {session.total_entries} | <b>Selected:</b> {len(session.selected_indices)}\n"
-        f"📄 <b>Page:</b> {session.page + 1} / {session.total_pages}\n\n"
-        f"<i>Click items to toggle, or click 'Select All' below:</i>"
-    )
+    caption = format_playlist_caption(session)
     try:
         await callback.message.edit_text(caption, reply_markup=keyboard)
     except MessageNotModified:
@@ -365,12 +389,7 @@ async def callback_pl_none(client: Client, callback: CallbackQuery):
 
     session.deselect_all()
     keyboard = build_playlist_keyboard(session)
-    caption = (
-        f"📋 <b>Playlist:</b> {session.playlist_title}\n"
-        f"📊 <b>Total Videos:</b> {session.total_entries} | <b>Selected:</b> 0\n"
-        f"📄 <b>Page:</b> {session.page + 1} / {session.total_pages}\n\n"
-        f"<i>Click items to toggle, or click 'Select All' below:</i>"
-    )
+    caption = format_playlist_caption(session)
     try:
         await callback.message.edit_text(caption, reply_markup=keyboard)
     except MessageNotModified:
@@ -411,12 +430,7 @@ async def callback_pl_back(client: Client, callback: CallbackQuery):
         return
 
     keyboard = build_playlist_keyboard(session)
-    caption = (
-        f"📋 <b>Playlist:</b> {session.playlist_title}\n"
-        f"📊 <b>Total Videos:</b> {session.total_entries} | <b>Selected:</b> {len(session.selected_indices)}\n"
-        f"📄 <b>Page:</b> {session.page + 1} / {session.total_pages}\n\n"
-        f"<i>Click items to toggle, or click 'Select All' below:</i>"
-    )
+    caption = format_playlist_caption(session)
     await callback.message.edit_text(caption, reply_markup=keyboard)
     await callback.answer()
 
@@ -489,8 +503,8 @@ async def process_single_download(
     url: str,
     quality_key: str,
     max_quality_height: Optional[int] = None,
-):
-    """Execute download, MP4 container verification, thumbnail processing, and upload."""
+) -> bool:
+    """Execute download, MP4 container verification, thumbnail processing, and upload. Returns True on success, False on error."""
     async with download_semaphore:
         updater = ThrottledProgressUpdater(status_msg, stage="Downloading 📥")
         temp_dir = None
@@ -558,11 +572,19 @@ async def process_single_download(
                     progress=updater.async_upload_hook,
                 )
 
-            await status_msg.delete()
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            return True
 
         except Exception as e:
             logger.error("Download failed for %s: %s", url, e, exc_info=True)
-            await status_msg.edit_text(f"❌ <b>Download Failed:</b>\n<code>{str(e)[:300]}</code>")
+            try:
+                await status_msg.edit_text(f"❌ <b>Download Failed:</b>\n<code>{str(e)[:300]}</code>")
+            except Exception:
+                pass
+            return False
         finally:
             if temp_dir:
                 safe_cleanup(temp_dir)
@@ -582,7 +604,13 @@ async def process_playlist_downloads(
 
     for idx, entry in enumerate(entries, start=1):
         video_title = entry.get("title", f"Video {idx}")
-        video_url = entry.get("url") or f"https://www.youtube.com/watch?v=entry['id']"
+        video_url = entry.get("url") or ""
+        video_id = entry.get("id") or ""
+        if not video_url or not video_url.startswith("http"):
+            if video_id:
+                video_url = f"https://www.youtube.com/watch?v={video_id}"
+            elif video_url:
+                video_url = f"https://www.youtube.com/watch?v={video_url}"
 
         await status_msg.edit_text(
             f"🔄 <b>Processing [{idx}/{total}]:</b>\n"
@@ -596,15 +624,18 @@ async def process_playlist_downloads(
                 chat_id=chat_id,
                 text=f"📥 <i>[{idx}/{total}] Downloading:</i> <b>{video_title}</b>",
             )
-            await process_single_download(
+            success = await process_single_download(
                 client=client,
                 status_msg=item_status,
                 chat_id=chat_id,
                 url=video_url,
                 quality_key=quality_key,
-                max_quality_height=1080 if quality_key == "max" else None,
+                max_quality_height=None,
             )
-            successful += 1
+            if success:
+                successful += 1
+            else:
+                failed += 1
         except Exception as e:
             logger.error("Failed playlist item %d (%s): %s", idx, video_url, e)
             failed += 1
@@ -616,4 +647,7 @@ async def process_playlist_downloads(
     if failed > 0:
         summary_text += f"⚠️ <b>Failed items:</b> {failed}\n"
 
-    await status_msg.edit_text(summary_text)
+    try:
+        await status_msg.edit_text(summary_text)
+    except Exception as e:
+        logger.debug("Final status edit skipped: %s", e)

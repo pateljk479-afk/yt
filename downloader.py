@@ -170,7 +170,7 @@ def analyze_video_qualities(info: dict) -> VideoQualityAnalysis:
             logger.info("Quality %s exceeds 2GB (%s bytes) -> EXCLUDED", tier_label, total_estimated)
             excluded_qualities.append((tier_label, total_estimated))
         else:
-            selector = f"bv*[height<={tier_height}][ext=mp4]+ba[ext=m4a]/bv*[height<={tier_height}]+ba/b[height<={tier_height}]/best"
+            selector = f"bv*[height<={tier_height}]+ba[ext=m4a]/bv*[height<={tier_height}]+ba/b[height<={tier_height}]/best"
             available_qualities.append(
                 QualityOption(
                     height=tier_height,
@@ -213,8 +213,15 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": not is_playlist,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        },
     }
-    
+    if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
+        ydl_opts["cookiefile"] = config.COOKIES_FILE
+        
     if is_playlist:
         ydl_opts["extract_flat"] = "in_playlist"
         
@@ -246,7 +253,14 @@ def build_ydl_options(
         "nocheckcertificate": True,
         "ignoreerrors": False,
         "logtostderr": False,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        },
     }
+    if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
+        opts["cookiefile"] = config.COOKIES_FILE
     
     if is_audio:
         opts["format"] = "ba/b"
@@ -287,21 +301,39 @@ def download_media(
 ) -> DownloadResult:
     """
     Download video or audio using optimal multithreaded yt-dlp settings.
-    Ensures MP4 format, valid thumbnail extraction, and returns DownloadResult.
+    Ensures MP4 format, 2 GB limit degradation, valid thumbnail extraction, and returns DownloadResult.
     """
     temp_dir = tempfile.mkdtemp(prefix="yt_dl_", dir=config.DOWNLOAD_DIR)
     is_audio = (quality_key == "audio")
     
-    # Determine format selector
+    # 1. Determine format selector with strict <= 2GB degradation
     if is_audio:
-        format_selector = "ba/b"
+        format_selector = "ba[ext=m4a]/ba/b"
     elif quality_key == "max":
-        h = max_quality_height or 1080
-        format_selector = f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/best"
+        target_h = max_quality_height
+        if not target_h:
+            try:
+                meta = extract_info(url, is_playlist=False)
+                analysis = analyze_video_qualities(meta)
+                target_h = analysis.max_quality.height if analysis.max_quality else 1080
+            except Exception as e:
+                logger.warning("Could not pre-analyze for max quality: %s", e)
+                target_h = 1080
+        format_selector = f"bv*[height<={target_h}]+ba[ext=m4a]/bv*[height<={target_h}]+ba/b[height<={target_h}]/best"
     else:
         try:
-            h = int(quality_key)
-            format_selector = f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/best"
+            requested_h = int(quality_key)
+            target_h = requested_h
+            # Check if requested format exceeds 2 GB limit; degrade if necessary
+            try:
+                meta = extract_info(url, is_playlist=False)
+                analysis = analyze_video_qualities(meta)
+                if analysis.max_quality and requested_h > analysis.max_quality.height:
+                    logger.info("Requested quality %dp exceeds 2GB -> degrading to %dp", requested_h, analysis.max_quality.height)
+                    target_h = analysis.max_quality.height
+            except Exception as e:
+                logger.debug("Format check skipped: %s", e)
+            format_selector = f"bv*[height<={target_h}]+ba[ext=m4a]/bv*[height<={target_h}]+ba/b[height<={target_h}]/best"
         except ValueError:
             format_selector = "bv*+ba/b"
             
@@ -336,7 +368,6 @@ def download_media(
             media_file = fpath
             
     if not media_file:
-        # Fallback search any non-thumbnail file
         for fname in os.listdir(temp_dir):
             fpath = os.path.join(temp_dir, fname)
             ext = os.path.splitext(fname)[1].lower()
@@ -347,13 +378,64 @@ def download_media(
     if not media_file or not os.path.exists(media_file):
         raise FileNotFoundError("Downloaded media file could not be found.")
         
+    # Fallback to download thumbnail directly from info metadata if missing on disk
+    if not thumb_file:
+        thumb_url = info.get("thumbnail")
+        if thumb_url:
+            try:
+                import urllib.request
+                target_thumb = os.path.join(temp_dir, "yt_thumb.jpg")
+                req = urllib.request.Request(
+                    thumb_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp, open(target_thumb, "wb") as out_f:
+                    out_f.write(resp.read())
+                if os.path.exists(target_thumb) and os.path.getsize(target_thumb) > 0:
+                    thumb_file = target_thumb
+            except Exception as e:
+                logger.warning("Failed to download thumbnail fallback from %s: %s", thumb_url, e)
+
     file_size = os.path.getsize(media_file)
-    if file_size > config.MAX_FILE_SIZE:
-        raise ValueError(
-            f"Downloaded file size ({file_size / (1024*1024):.1f} MB) exceeds "
-            f"Telegram's maximum limit of {config.MAX_FILE_SIZE / (1024*1024):.0f} MB."
+    # Check Telegram 2 GB ceiling: if exceeded, degrade to lower resolution automatically
+    if file_size > config.MAX_FILE_SIZE and not is_audio:
+        logger.warning(
+            "Downloaded file size (%d bytes) exceeds Telegram 2GB limit! Degrading resolution to 720p/480p...",
+            file_size,
         )
-        
+        try:
+            os.remove(media_file)
+            fallback_selector = "bv*[height<=720]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/best"
+            ydl_opts_fb = build_ydl_options(
+                target_dir=temp_dir,
+                format_selector=fallback_selector,
+                progress_hook=progress_hook,
+                is_audio=is_audio,
+            )
+            with yt_dlp.YoutubeDL(ydl_opts_fb) as ydl_fb:
+                info = ydl_fb.extract_info(url, download=True)
+            for fname in os.listdir(temp_dir):
+                fpath = os.path.join(temp_dir, fname)
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in target_exts:
+                    media_file = fpath
+                    break
+            file_size = os.path.getsize(media_file) if media_file and os.path.exists(media_file) else file_size
+        except Exception as e:
+            logger.error("Degradation fallback download failed: %s", e)
+
+    # Preserve original YouTube title in file name on disk
+    clean_base = sanitize_filename(title)
+    final_ext = ".mp3" if is_audio else ".mp4"
+    desired_filename = f"{clean_base}{final_ext}"
+    desired_path = os.path.join(temp_dir, desired_filename)
+    if os.path.abspath(media_file) != os.path.abspath(desired_path) and not os.path.exists(desired_path):
+        try:
+            os.rename(media_file, desired_path)
+            media_file = desired_path
+        except Exception as e:
+            logger.warning("Could not rename to desired filename %s: %s", desired_path, e)
+
     original_filename = os.path.basename(media_file)
     
     return DownloadResult(

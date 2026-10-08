@@ -82,10 +82,11 @@ def verify_media_integrity(file_path: str, is_audio: bool = False) -> bool:
     if not is_audio and file_path.lower().endswith(".mp4"):
         try:
             with open(file_path, "rb") as f:
-                header = f.read(16)
+                header = f.read(64)
                 # Check for standard 'ftyp' box signature
                 if b"ftyp" not in header:
-                    logger.warning("MP4 header missing 'ftyp' signature: %s", file_path)
+                    logger.error("MP4 header missing 'ftyp' signature: %s", file_path)
+                    return False
         except Exception as e:
             logger.error("Error reading file header: %s", e)
             return False
