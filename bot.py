@@ -240,6 +240,24 @@ async def auto_link_handler(client: Client, message: Message):
         await handle_video_request(client, message, text)
 
 
+@app.on_message(filters.document & filters.private)
+async def handle_document(client: Client, message: Message):
+    doc = message.document
+    if doc and doc.file_name and "cookie" in doc.file_name.lower() and doc.file_name.endswith(".txt"):
+        status_msg = await message.reply_text("📥 <i>Receiving cookies file...</i>")
+        try:
+            downloaded = await message.download(file_name="cookies.txt")
+            size_kb = os.path.getsize(downloaded) / 1024
+            logger.info("Saved cookies file to %s (%.1f KB)", downloaded, size_kb)
+            await status_msg.edit_text(
+                f"✅ <b>YouTube cookies file installed successfully ({size_kb:.1f} KB)!</b>\n\n"
+                "Your bot can now bypass YouTube bot verification on cloud servers. Try sending a /video or /playlist link now!"
+            )
+        except Exception as e:
+            logger.error("Failed to save cookies file: %s", e)
+            await status_msg.edit_text(f"❌ Failed to save cookies file: {e}")
+
+
 # =====================================================================
 # REQUEST PROCESSORS
 # =====================================================================

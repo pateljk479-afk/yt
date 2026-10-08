@@ -215,12 +215,14 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
         "noplaylist": not is_playlist,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["ios", "mweb", "android", "web"],
             }
         },
+        "remote_components": ["ejs:github"],
     }
-    if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
-        ydl_opts["cookiefile"] = config.COOKIES_FILE
+    cookies_path = config.COOKIES_FILE if (config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE)) else ("cookies.txt" if os.path.exists("cookies.txt") else None)
+    if cookies_path:
+        ydl_opts["cookiefile"] = cookies_path
         
     if is_playlist:
         ydl_opts["extract_flat"] = "in_playlist"
@@ -255,12 +257,14 @@ def build_ydl_options(
         "logtostderr": False,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["ios", "mweb", "android", "web"],
             }
         },
+        "remote_components": ["ejs:github"],
     }
-    if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
-        opts["cookiefile"] = config.COOKIES_FILE
+    cookies_path = config.COOKIES_FILE if (config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE)) else ("cookies.txt" if os.path.exists("cookies.txt") else None)
+    if cookies_path:
+        opts["cookiefile"] = cookies_path
     
     if is_audio:
         opts["format"] = "ba/b"
