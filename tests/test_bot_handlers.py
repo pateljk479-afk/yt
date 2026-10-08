@@ -70,25 +70,24 @@ def test_format_playlist_caption():
 
 @pytest.mark.asyncio
 async def test_throttled_progress_updater_upload_speed():
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import AsyncMock, MagicMock, patch
     from bot import ThrottledProgressUpdater
 
     mock_msg = MagicMock()
     mock_msg.edit_text = AsyncMock()
 
-    updater = ThrottledProgressUpdater(mock_msg, stage="Uploading 📤", interval=0.0)
-    
-    # Simulate first chunk
-    await updater.async_upload_hook(current=10 * 1024 * 1024, total=100 * 1024 * 1024)
-    # Simulate second chunk 1 second later
-    updater.last_upload_time -= 1.0  # simulate 1 sec elapsed
-    await updater.async_upload_hook(current=30 * 1024 * 1024, total=100 * 1024 * 1024)
+    # Deterministic timestamps: chunk 1 at 1000.0, chunk 2 at 1001.0 (dt = 1.0s)
+    with patch("time.time", side_effect=[1000.0, 1001.0]):
+        updater = ThrottledProgressUpdater(mock_msg, stage="Uploading 📤", interval=0.0)
+        # Simulate first chunk (10 MB)
+        await updater.async_upload_hook(current=10 * 1024 * 1024, total=100 * 1024 * 1024)
+        # Simulate second chunk (30 MB, delta = 20 MB over 1.0s)
+        await updater.async_upload_hook(current=30 * 1024 * 1024, total=100 * 1024 * 1024)
 
     assert mock_msg.edit_text.call_count >= 1
     call_args = mock_msg.edit_text.call_args[0][0]
     assert "Uploading" in call_args
     assert "Progress:" in call_args
-    # Speed should be non-zero and formatted
     assert "MB/s" in call_args
     assert "20.0 MB/s" in call_args
 
