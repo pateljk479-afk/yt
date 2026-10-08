@@ -34,8 +34,8 @@ COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt" if os.path.exists("cookie
 # Check if aria2c external downloader is available on system
 ARIA2C_AVAILABLE = bool(shutil.which("aria2c"))
 
-# Web Server / Health Check for Cloud Hosting (Render, Railway, Koyeb)
-PORT = int(os.getenv("PORT", "8080"))
+# Web Server / Health Check for Cloud Hosting (Render, Railway, Pterodactyl, BotKeep)
+PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", "8080")))
 HOST = os.getenv("HOST", "0.0.0.0")
 ENABLE_WEB_SERVER = os.getenv("ENABLE_WEB_SERVER", "true").lower() in ("true", "1", "yes")
 

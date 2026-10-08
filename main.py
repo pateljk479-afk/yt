@@ -58,12 +58,27 @@ async def main():
     await app.start()
     bot_info = await app.get_me()
     logger.info("Bot successfully authenticated as @%s (ID: %s)", bot_info.username, bot_info.id)
-    logger.info("Service is LIVE and waiting for commands (/video, /playlist)...")
+    logger.info("==================================================")
+    logger.info("🚀 Server marked as running and ready!")
+    logger.info("   Bot username : @%s", bot_info.username)
+    logger.info("   Send /start to your bot on Telegram to begin.")
+    logger.info("==================================================")
 
-    # 4. Idle loop
+    # 4. Heartbeat task to keep logs active and monitor uptime
+    async def heartbeat():
+        minute_counter = 0
+        while True:
+            await asyncio.sleep(300)  # every 5 minutes
+            minute_counter += 5
+            logger.info("💓 [HEARTBEAT] Bot @%s is active & listening (uptime: %d min)", bot_info.username, minute_counter)
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+
+    # 5. Idle loop
     try:
         await idle()
     finally:
+        heartbeat_task.cancel()
         logger.info("Shutting down service...")
         await app.stop()
         if web_runner:

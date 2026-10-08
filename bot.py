@@ -127,6 +127,8 @@ def is_playlist_url(text: str) -> bool:
 
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
+    user_tag = getattr(message.from_user, "username", str(message.from_user.id)) if message.from_user else "Unknown"
+    logger.info("📩 Received /start command from user @%s (chat_id=%s)", user_tag, message.chat.id)
     welcome_text = (
         "👋 <b>Welcome to High-Speed YouTube Downloader Bot!</b>\n\n"
         "⚡ <b>Features:</b>\n"
@@ -147,6 +149,7 @@ async def start_command(client: Client, message: Message):
 
 @app.on_message(filters.command("help"))
 async def help_command(client: Client, message: Message):
+    logger.info("📩 Received /help command from chat_id=%s", message.chat.id)
     help_text = (
         "📖 <b>How to Use This Bot:</b>\n\n"
         "<b>1. Downloading a Single Video:</b>\n"
@@ -195,11 +198,13 @@ async def video_command(client: Client, message: Message):
     if len(parts) < 2:
         if message.reply_to_message and message.reply_to_message.text:
             url = message.reply_to_message.text.strip()
+            logger.info("📩 Received /video command (via reply) from chat_id=%s: %s", message.chat.id, url)
             await handle_video_request(client, message, url)
             return
         await message.reply_text("⚠️ <b>Please provide a YouTube video URL:</b>\n<code>/video https://youtu.be/...</code>")
         return
     url = parts[1].strip()
+    logger.info("📩 Received /video command from chat_id=%s: %s", message.chat.id, url)
     await handle_video_request(client, message, url)
 
 
@@ -209,17 +214,20 @@ async def playlist_command(client: Client, message: Message):
     if len(parts) < 2:
         if message.reply_to_message and message.reply_to_message.text:
             url = message.reply_to_message.text.strip()
+            logger.info("📩 Received /playlist command (via reply) from chat_id=%s: %s", message.chat.id, url)
             await handle_playlist_request(client, message, url)
             return
         await message.reply_text("⚠️ <b>Please provide a YouTube playlist URL:</b>\n<code>/playlist https://youtube.com/playlist?list=...</code>")
         return
     url = parts[1].strip()
+    logger.info("📩 Received /playlist command from chat_id=%s: %s", message.chat.id, url)
     await handle_playlist_request(client, message, url)
 
 
 @app.on_message(filters.text & filters.private)
 async def auto_link_handler(client: Client, message: Message):
     text = message.text.strip()
+    logger.info("📩 Received text message from chat_id=%s: %s", message.chat.id, text[:80])
     if not is_youtube_url(text):
         await message.reply_text("ℹ️ Send a YouTube video or playlist link, or type /help for instructions.")
         return
