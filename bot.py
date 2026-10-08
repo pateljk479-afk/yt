@@ -58,8 +58,10 @@ class ThrottledProgressUpdater:
         self.last_update_time = 0.0
         self.start_upload_time = 0.0
         self.last_upload_bytes = 0
-        self.last_upload_time = 0.0
-        self.loop = asyncio.get_event_loop()
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.get_event_loop()
 
     def sync_hook(self, d: dict):
         """yt-dlp progress hook running in worker thread."""
@@ -245,7 +247,7 @@ async def auto_link_handler(client: Client, message: Message):
 async def handle_video_request(client: Client, message: Message, url: str):
     status_msg = await message.reply_text("🔍 <i>Analyzing video formats and size limits...</i>")
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(None, extract_info, url, False)
         analysis = analyze_video_qualities(info)
 
@@ -280,7 +282,7 @@ async def handle_video_request(client: Client, message: Message, url: str):
 async def handle_playlist_request(client: Client, message: Message, url: str):
     status_msg = await message.reply_text("🔍 <i>Extracting playlist items... Please wait.</i>")
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(None, extract_info, url, True)
 
         entries = list(info.get("entries", []))
@@ -518,7 +520,7 @@ async def process_single_download(
         temp_dir = None
         try:
             await status_msg.edit_text("⚡ <b>Starting high-speed download...</b>")
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             # Execute yt-dlp download in background thread pool
             result: DownloadResult = await loop.run_in_executor(
