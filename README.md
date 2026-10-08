@@ -54,7 +54,7 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 ├── requirements.txt        # Python package dependencies
 ├── .env.example            # Sample configuration file
 ├── .gitignore              # Files and directories excluded from git
-└── tests/                  # Comprehensive automated test suite (27 tests)
+└── tests/                  # Comprehensive automated test suite (33 tests)
     ├── test_downloader.py      # 2GB degradation, audio size calculation & sanitization
     ├── test_uploader.py        # Progress bars, media integrity & thumbnail conversion
     ├── test_session_manager.py # 10-per-page pagination, toggle, select all
