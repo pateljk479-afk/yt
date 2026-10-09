@@ -3,7 +3,7 @@ pyrogram>=2.0.106
 tgcrypto>=1.2.5
 
 # YouTube & Media Processing
-yt-dlp>=2024.0.0
+yt-dlp>=2026.8.0
 pillow>=10.0.0
 
 # Asynchronous HTTP & Cloud Health Check
