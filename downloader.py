@@ -213,11 +213,6 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": not is_playlist,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "mweb", "android", "web"],
-            }
-        },
         "remote_components": ["ejs:github"],
     }
     cookies_path = config.COOKIES_FILE if (config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE)) else ("cookies.txt" if os.path.exists("cookies.txt") else None)
@@ -255,11 +250,6 @@ def build_ydl_options(
         "nocheckcertificate": True,
         "ignoreerrors": False,
         "logtostderr": False,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "mweb", "android", "web"],
-            }
-        },
         "remote_components": ["ejs:github"],
     }
     cookies_path = config.COOKIES_FILE if (config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE)) else ("cookies.txt" if os.path.exists("cookies.txt") else None)
@@ -323,7 +313,7 @@ def download_media(
             except Exception as e:
                 logger.warning("Could not pre-analyze for max quality: %s", e)
                 target_h = 1080
-        format_selector = f"bv*[height<={target_h}]+ba[ext=m4a]/bv*[height<={target_h}]+ba/b[height<={target_h}]/best"
+        format_selector = f"bv*[ext=mp4][height<={target_h}]+ba[ext=m4a]/b[ext=mp4][height<={target_h}]/bv*[height<={target_h}]+ba/best"
     else:
         try:
             requested_h = int(quality_key)
@@ -337,9 +327,9 @@ def download_media(
                     target_h = analysis.max_quality.height
             except Exception as e:
                 logger.debug("Format check skipped: %s", e)
-            format_selector = f"bv*[height<={target_h}]+ba[ext=m4a]/bv*[height<={target_h}]+ba/b[height<={target_h}]/best"
+            format_selector = f"bv*[ext=mp4][height<={target_h}]+ba[ext=m4a]/b[ext=mp4][height<={target_h}]/bv*[height<={target_h}]+ba/best"
         except ValueError:
-            format_selector = "bv*+ba/b"
+            format_selector = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/best"
             
     ydl_opts = build_ydl_options(
         target_dir=temp_dir,
@@ -409,7 +399,7 @@ def download_media(
         )
         try:
             os.remove(media_file)
-            fallback_selector = "bv*[height<=720]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/best"
+            fallback_selector = "bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/bv*[height<=720]+ba/best"
             ydl_opts_fb = build_ydl_options(
                 target_dir=temp_dir,
                 format_selector=fallback_selector,
