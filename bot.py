@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import logging
+import json
 from typing import Optional, List
 
 from pyrogram import Client, filters
@@ -240,22 +241,64 @@ async def auto_link_handler(client: Client, message: Message):
         await handle_video_request(client, message, text)
 
 
+def json_to_netscape(json_str: str) -> str:
+    try:
+        cookies = json.loads(json_str)
+        if not isinstance(cookies, list):
+            return ""
+        
+        lines = ["# Netscape HTTP Cookie File\n# http://curl.haxx.se/rfc/cookie_spec.html\n# This is a generated file!  Do not edit.\n"]
+        for c in cookies:
+            domain = c.get("domain", "")
+            include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+            path = c.get("path", "/")
+            secure = "TRUE" if c.get("secure", False) else "FALSE"
+            expiration = c.get("expirationDate") or c.get("expiry") or 0
+            expiry = str(int(expiration))
+            name = c.get("name", "")
+            value = c.get("value", "")
+            lines.append(f"{domain}\t{include_subdomains}\t{path}\t{secure}\t{expiry}\t{name}\t{value}")
+            
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
 @app.on_message(filters.document & filters.private)
 async def handle_document(client: Client, message: Message):
     doc = message.document
-    if doc and doc.file_name and "cookie" in doc.file_name.lower() and doc.file_name.endswith(".txt"):
-        status_msg = await message.reply_text("📥 <i>Receiving cookies file...</i>")
-        try:
-            downloaded = await message.download(file_name="cookies.txt")
-            size_kb = os.path.getsize(downloaded) / 1024
-            logger.info("Saved cookies file to %s (%.1f KB)", downloaded, size_kb)
-            await status_msg.edit_text(
-                f"✅ <b>YouTube cookies file installed successfully ({size_kb:.1f} KB)!</b>\n\n"
-                "Your bot can now bypass YouTube bot verification on cloud servers. Try sending a /video or /playlist link now!"
-            )
-        except Exception as e:
-            logger.error("Failed to save cookies file: %s", e)
-            await status_msg.edit_text(f"❌ Failed to save cookies file: {e}")
+    if doc and doc.file_name:
+        fname = doc.file_name.lower()
+        if ("cookie" in fname or "youtube" in fname) and (fname.endswith(".txt") or fname.endswith(".json")):
+            status_msg = await message.reply_text("📥 <i>Receiving cookies file...</i>")
+            try:
+                temp_path = await message.download()
+                
+                with open(temp_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                
+                # Check if it's JSON
+                if content.strip().startswith("[") and content.strip().endswith("]"):
+                    netscape_content = json_to_netscape(content)
+                    if netscape_content:
+                        content = netscape_content
+                
+                # Save as cookies.txt
+                with open("cookies.txt", "w", encoding="utf-8") as f:
+                    f.write(content)
+                    
+                if os.path.abspath(temp_path) != os.path.abspath("cookies.txt"):
+                    try: os.remove(temp_path)
+                    except: pass
+                    
+                size_kb = os.path.getsize("cookies.txt") / 1024
+                logger.info("Saved cookies file to cookies.txt (%.1f KB)", size_kb)
+                await status_msg.edit_text(
+                    f"✅ <b>YouTube cookies file installed successfully ({size_kb:.1f} KB)!</b>\n\n"
+                    "Your bot can now bypass YouTube bot verification on cloud servers. Try sending a /video or /playlist link now!"
+                )
+            except Exception as e:
+                logger.error("Failed to save cookies file: %s", e)
+                await status_msg.edit_text(f"❌ Failed to save cookies file: {e}")
 
 
 # =====================================================================
