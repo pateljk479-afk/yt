@@ -2,6 +2,8 @@ import os
 import re
 import tempfile
 import logging
+import time
+from http.cookiejar import MozillaCookieJar
 from dataclasses import dataclass
 from typing import Optional, Callable, List, Tuple
 import yt_dlp
@@ -56,6 +58,78 @@ class DownloadResult:
     file_size: int
     is_audio: bool
     temp_dir: str
+
+
+@dataclass(frozen=True)
+class YouTubeCookieValidation:
+    """Non-sensitive result of checking a Netscape YouTube cookie export."""
+
+    valid: bool
+    reason: str
+    youtube_cookie_count: int = 0
+
+
+# This mirrors yt-dlp's account-cookie check: LOGIN_INFO confirms that the
+# browser session is signed in, and one of these cookies signs API requests.
+# Cookie values are never logged.
+YOUTUBE_AUTH_HASH_COOKIES = {
+    "SAPISID",
+    "__Secure-1PAPISID",
+    "__Secure-3PAPISID",
+}
+
+
+def validate_youtube_cookie_file(path: str) -> YouTubeCookieValidation:
+    """Check whether *path* contains a usable YouTube account cookie export.
+
+    This validates only the local file structure and account-cookie set; it
+    deliberately does not send cookie values to a validation endpoint.
+    """
+    if not path or not os.path.isfile(path):
+        return YouTubeCookieValidation(False, "Cookie file was not found.")
+
+    try:
+        with open(path, "r", encoding="utf-8-sig", newline="") as cookie_file:
+            first_line = cookie_file.readline().strip()
+        if first_line not in {"# Netscape HTTP Cookie File", "# HTTP Cookie File"}:
+            return YouTubeCookieValidation(
+                False,
+                "The file is not in Netscape cookies.txt format (its first line is invalid).",
+            )
+
+        jar = MozillaCookieJar(path)
+        # Retain expired/session cookies while loading so we can distinguish a
+        # malformed file from an expired account export below.
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return YouTubeCookieValidation(False, f"Could not read the cookies file: {exc}")
+
+    now = time.time()
+    youtube_cookies = [
+        cookie for cookie in jar
+        if cookie.domain.lstrip(".").lower().endswith("youtube.com")
+    ]
+    if not youtube_cookies:
+        return YouTubeCookieValidation(False, "The file contains no youtube.com cookies.")
+
+    live_names = {
+        cookie.name for cookie in youtube_cookies
+        if cookie.expires is None or cookie.expires == 0 or cookie.expires > now
+    }
+    if "LOGIN_INFO" not in live_names:
+        return YouTubeCookieValidation(
+            False,
+            "No active LOGIN_INFO cookie was found, so this is not a signed-in YouTube session.",
+            len(youtube_cookies),
+        )
+    if not (live_names & YOUTUBE_AUTH_HASH_COOKIES):
+        return YouTubeCookieValidation(
+            False,
+            "The signed-in session is missing the YouTube authentication cookies required by yt-dlp.",
+            len(youtube_cookies),
+        )
+
+    return YouTubeCookieValidation(True, "Signed-in YouTube cookies detected.", len(youtube_cookies))
 
 
 def sanitize_filename(name: str) -> str:
@@ -200,11 +274,19 @@ def analyze_video_qualities(info: dict) -> VideoQualityAnalysis:
 
 
 def get_cookiefile_path() -> Optional[str]:
-    """Find absolute path to cookies.txt if present on the system."""
+    """Return a validated YouTube account cookie file, when one is available."""
     if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
-        return os.path.abspath(config.COOKIES_FILE)
-    if os.path.exists("cookies.txt"):
-        return os.path.abspath("cookies.txt")
+        candidate = os.path.abspath(config.COOKIES_FILE)
+    elif os.path.exists("cookies.txt"):
+        candidate = os.path.abspath("cookies.txt")
+    else:
+        return None
+
+    validation = validate_youtube_cookie_file(candidate)
+    if validation.valid:
+        return candidate
+
+    logger.warning("Ignoring invalid YouTube cookie file: %s", validation.reason)
     return None
 
 
@@ -226,11 +308,6 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
             "skip_download": True,
             "noplaylist": not is_playlist,
             "remote_components": ["ejs:github"],
-            "extractor_args": {
-                "youtube": {
-                    "player_skip": ["tv", "tv_downgraded"]
-                }
-            }
         }
         if use_cookies and cookies_path:
             opts["cookiefile"] = cookies_path
@@ -280,12 +357,6 @@ def build_ydl_options(
         "ignoreerrors": False,
         "logtostderr": False,
         "remote_components": ["ejs:github"],
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["default", "web", "android"],
-                "player_skip": ["tv", "tv_downgraded"]
-            }
-        }
     }
     cookies_path = get_cookiefile_path()
     if use_cookies and cookies_path:
@@ -380,8 +451,10 @@ def download_media(
     except Exception as err:
         err_msg = str(err)
         logger.warning("Primary download attempt failed for %s: %s", url, err_msg)
-        # Fallback 1: If cookies caused 'The page needs to be reloaded' or format error, retry without cookies
-        if get_cookiefile_path() and ("The page needs to be reloaded" in err_msg or "Sign in to confirm" in err_msg or "Requested format is not available" in err_msg):
+        # A format-selection error can be retried without cookies. Authentication
+        # errors must keep the cookies: retrying from a cloud IP anonymously only
+        # guarantees YouTube's "confirm you're not a bot" response.
+        if get_cookiefile_path() and "Requested format is not available" in err_msg:
             logger.info("Retrying download without cookies for %s...", url)
             ydl_opts_nocookies = build_ydl_options(
                 target_dir=temp_dir,

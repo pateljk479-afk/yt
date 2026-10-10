@@ -3,6 +3,7 @@ import time
 import asyncio
 import logging
 import json
+import tempfile
 from typing import Optional, List
 
 from pyrogram import Client, filters
@@ -16,6 +17,7 @@ from downloader import (
     download_media,
     DownloadResult,
     sanitize_filename,
+    validate_youtube_cookie_file,
 )
 from session_manager import session_manager, PlaylistSession, VideoSession
 from keyboards import (
@@ -282,34 +284,51 @@ async def handle_document(client: Client, message: Message):
                     if netscape_content:
                         content = netscape_content
                 
-                # Save as cookies.txt with absolute path
+                # Validate in a staging file first. A bad export must not
+                # overwrite a previously working cookies.txt file.
                 abs_cookie_path = os.path.abspath("cookies.txt")
-                with open(abs_cookie_path, "w", encoding="utf-8") as f:
+                staged_cookie = tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    suffix=".cookies.txt",
+                    prefix="youtube_cookie_upload_",
+                    dir=os.path.dirname(abs_cookie_path),
+                    delete=False,
+                )
+                with staged_cookie as f:
                     f.write(content)
+                validation = validate_youtube_cookie_file(staged_cookie.name)
+                if not validation.valid:
+                    try:
+                        os.remove(staged_cookie.name)
+                    except OSError:
+                        pass
+                    if os.path.abspath(temp_path) != abs_cookie_path:
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+                    await status_msg.edit_text(
+                        "❌ <b>Cookies were not installed.</b>\n\n"
+                        f"<b>Reason:</b> {validation.reason}\n\n"
+                        "Export fresh <code>youtube.com</code> cookies from a signed-in private/incognito window, then close that window after exporting. "
+                        "The previous cookie file was kept unchanged."
+                    )
+                    return
+
+                os.replace(staged_cookie.name, abs_cookie_path)
                 config.COOKIES_FILE = abs_cookie_path
-                    
+
                 if os.path.abspath(temp_path) != abs_cookie_path:
                     try: os.remove(temp_path)
-                    except: pass
-                    
-                size_kb = os.path.getsize(abs_cookie_path) / 1024
-                logger.info("Saved cookies file to %s (%.1f KB)", abs_cookie_path, size_kb)
+                    except OSError: pass
 
-                has_auth = any(k in content for k in ("LOGIN_INFO", "SID", "SAPISID", "SSID", "__Secure-1PSID"))
-                if has_auth:
-                    await status_msg.edit_text(
-                        f"✅ <b>YouTube cookies installed successfully ({size_kb:.1f} KB)!</b>\n\n"
-                        "🔑 <b>Status:</b> Active logged-in session detected.\n"
-                        "Your bot is ready to bypass YouTube bot verification on cloud servers! Send a /video or /playlist link now."
-                    )
-                else:
-                    await status_msg.edit_text(
-                        f"⚠️ <b>YouTube cookies saved ({size_kb:.1f} KB), but WARNING:</b>\n\n"
-                        "❌ <b>No YouTube login session detected</b> (missing <code>LOGIN_INFO</code> or <code>SID</code>).\n\n"
-                        "Cloud hosting servers (like BotKeep/Render) require cookies exported while <b>actively logged in to a YouTube account</b>. "
-                        "Without login cookies, YouTube will block cloud servers with <i>'Sign in to confirm you’re not a bot'</i>.\n\n"
-                        "👉 <i>Please log in to YouTube in your browser and re-export your cookies!</i>"
-                    )
+                size_kb = os.path.getsize(abs_cookie_path) / 1024
+                logger.info("Installed validated YouTube cookie export (%d YouTube cookies, %.1f KB)", validation.youtube_cookie_count, size_kb)
+                await status_msg.edit_text(
+                    f"✅ <b>Signed-in YouTube cookies installed ({size_kb:.1f} KB).</b>\n\n"
+                    "The file passed the local account-cookie checks and will be used for the next download."
+                )
             except Exception as e:
                 logger.error("Failed to save cookies file: %s", e)
                 await status_msg.edit_text(f"❌ Failed to save cookies file: {e}")

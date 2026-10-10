@@ -17,6 +17,7 @@ downloads/
 
 # Environment & credentials
 .env
+cookies.txt
 
 # Pytest / coverage
 .pytest_cache/

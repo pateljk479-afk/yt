@@ -4,6 +4,7 @@ from downloader import (
     estimate_audio_size,
     analyze_video_qualities,
     build_ydl_options,
+    validate_youtube_cookie_file,
     RESOLUTION_TIERS,
 )
 import config
@@ -134,8 +135,38 @@ def test_build_ydl_options():
     assert opts["concurrent_fragment_downloads"] == config.CONCURRENT_FRAGMENT_DOWNLOADS
     assert opts["writethumbnail"] is True
     assert opts["postprocessor_args"] == {"ffmpeg": ["-movflags", "+faststart"]}
-    assert "extractor_args" in opts
-    assert "android" in opts["extractor_args"]["youtube"]["player_client"]
+    # Let yt-dlp choose its current non-token-gated player clients. Pinning a
+    # static list becomes stale as YouTube changes its client requirements.
+    assert "extractor_args" not in opts
+
+
+def test_validate_youtube_cookie_file_requires_a_signed_in_session(tmp_path):
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t2147483647\tLOGIN_INFO\tredacted\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t2147483647\t__Secure-3PAPISID\tredacted\n",
+        encoding="utf-8",
+    )
+
+    validation = validate_youtube_cookie_file(str(cookie_file))
+
+    assert validation.valid is True
+    assert validation.youtube_cookie_count == 2
+
+
+def test_validate_youtube_cookie_file_rejects_logged_out_export(tmp_path):
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t2147483647\t__Secure-3PAPISID\tredacted\n",
+        encoding="utf-8",
+    )
+
+    validation = validate_youtube_cookie_file(str(cookie_file))
+
+    assert validation.valid is False
+    assert "LOGIN_INFO" in validation.reason
 
 
 def test_download_media_quality_degradation_logic():
