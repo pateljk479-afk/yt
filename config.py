@@ -29,7 +29,7 @@ MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
 MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "8"))
 BUFFER_SIZE = int(os.getenv("BUFFER_SIZE", str(1024 * 1024)))  # 1 MB I/O buffer
 HTTP_CHUNK_SIZE = int(os.getenv("HTTP_CHUNK_SIZE", str(10 * 1024 * 1024)))  # 10 MB HTTP chunks
-COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt" if os.path.exists("cookies.txt") else "")
+COOKIES_FILE = os.getenv("COOKIES_FILE", os.path.abspath("cookies.txt") if os.path.exists("cookies.txt") else "")
 COOKIES_DATA = os.getenv("COOKIES_DATA", os.getenv("YOUTUBE_COOKIES", ""))
 
 # Auto-generate cookies.txt from environment variable (supports raw text or base64)
@@ -44,9 +44,10 @@ if COOKIES_DATA:
                 _raw = base64.b64decode(_raw).decode("utf-8")
             except Exception:
                 pass
-        with open("cookies.txt", "w", encoding="utf-8") as _f:
+        abs_cookie_target = os.path.abspath("cookies.txt")
+        with open(abs_cookie_target, "w", encoding="utf-8") as _f:
             _f.write(_raw)
-        COOKIES_FILE = "cookies.txt"
+        COOKIES_FILE = abs_cookie_target
     except Exception as _e:
         pass
 

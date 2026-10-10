@@ -282,20 +282,34 @@ async def handle_document(client: Client, message: Message):
                     if netscape_content:
                         content = netscape_content
                 
-                # Save as cookies.txt
-                with open("cookies.txt", "w", encoding="utf-8") as f:
+                # Save as cookies.txt with absolute path
+                abs_cookie_path = os.path.abspath("cookies.txt")
+                with open(abs_cookie_path, "w", encoding="utf-8") as f:
                     f.write(content)
+                config.COOKIES_FILE = abs_cookie_path
                     
-                if os.path.abspath(temp_path) != os.path.abspath("cookies.txt"):
+                if os.path.abspath(temp_path) != abs_cookie_path:
                     try: os.remove(temp_path)
                     except: pass
                     
-                size_kb = os.path.getsize("cookies.txt") / 1024
-                logger.info("Saved cookies file to cookies.txt (%.1f KB)", size_kb)
-                await status_msg.edit_text(
-                    f"✅ <b>YouTube cookies file installed successfully ({size_kb:.1f} KB)!</b>\n\n"
-                    "Your bot can now bypass YouTube bot verification on cloud servers. Try sending a /video or /playlist link now!"
-                )
+                size_kb = os.path.getsize(abs_cookie_path) / 1024
+                logger.info("Saved cookies file to %s (%.1f KB)", abs_cookie_path, size_kb)
+
+                has_auth = any(k in content for k in ("LOGIN_INFO", "SID", "SAPISID", "SSID", "__Secure-1PSID"))
+                if has_auth:
+                    await status_msg.edit_text(
+                        f"✅ <b>YouTube cookies installed successfully ({size_kb:.1f} KB)!</b>\n\n"
+                        "🔑 <b>Status:</b> Active logged-in session detected.\n"
+                        "Your bot is ready to bypass YouTube bot verification on cloud servers! Send a /video or /playlist link now."
+                    )
+                else:
+                    await status_msg.edit_text(
+                        f"⚠️ <b>YouTube cookies saved ({size_kb:.1f} KB), but WARNING:</b>\n\n"
+                        "❌ <b>No YouTube login session detected</b> (missing <code>LOGIN_INFO</code> or <code>SID</code>).\n\n"
+                        "Cloud hosting servers (like BotKeep/Render) require cookies exported while <b>actively logged in to a YouTube account</b>. "
+                        "Without login cookies, YouTube will block cloud servers with <i>'Sign in to confirm you’re not a bot'</i>.\n\n"
+                        "👉 <i>Please log in to YouTube in your browser and re-export your cookies!</i>"
+                    )
             except Exception as e:
                 logger.error("Failed to save cookies file: %s", e)
                 await status_msg.edit_text(f"❌ Failed to save cookies file: {e}")

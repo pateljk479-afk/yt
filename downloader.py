@@ -199,6 +199,15 @@ def analyze_video_qualities(info: dict) -> VideoQualityAnalysis:
     )
 
 
+def get_cookiefile_path() -> Optional[str]:
+    """Find absolute path to cookies.txt if present on the system."""
+    if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
+        return os.path.abspath(config.COOKIES_FILE)
+    if os.path.exists("cookies.txt"):
+        return os.path.abspath("cookies.txt")
+    return None
+
+
 def extract_info(url: str, is_playlist: bool = False) -> dict:
     """Extract YouTube metadata synchronously via yt-dlp."""
     # Clean URL if single video
@@ -215,7 +224,7 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
         "noplaylist": not is_playlist,
         "remote_components": ["ejs:github"],
     }
-    cookies_path = config.COOKIES_FILE if (config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE)) else ("cookies.txt" if os.path.exists("cookies.txt") else None)
+    cookies_path = get_cookiefile_path()
     if cookies_path:
         ydl_opts["cookiefile"] = cookies_path
         
@@ -252,7 +261,7 @@ def build_ydl_options(
         "logtostderr": False,
         "remote_components": ["ejs:github"],
     }
-    cookies_path = config.COOKIES_FILE if (config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE)) else ("cookies.txt" if os.path.exists("cookies.txt") else None)
+    cookies_path = get_cookiefile_path()
     if cookies_path:
         opts["cookiefile"] = cookies_path
     
