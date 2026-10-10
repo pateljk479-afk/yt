@@ -42,17 +42,21 @@ async def main():
     logger.info("  - Max Concurrent Downloads: %d", config.MAX_CONCURRENT_DOWNLOADS)
     logger.info("  - Fragment Parallel Streams: %d", config.CONCURRENT_FRAGMENT_DOWNLOADS)
     logger.info("  - aria2c Accelerated Downloader: %s", "Enabled" if config.ARIA2C_AVAILABLE else "Disabled (yt-dlp native multithread)")
-    logger.info("  - YouTube Egress Proxy: %s", "Enabled" if config.YOUTUBE_PROXY else "Disabled (cloud IP used)")
+    if getattr(config, "YOUTUBE_PROXIES", None):
+        logger.info("  - YouTube Egress Proxy: Enabled (%d proxies configured in pool)", len(config.YOUTUBE_PROXIES))
+        for idx, p in enumerate(config.YOUTUBE_PROXIES, 1):
+            p_status = await asyncio.to_thread(check_proxy, p)
+            logger.info("    [Proxy %d/%d] %s", idx, len(config.YOUTUBE_PROXIES), p_status)
+    elif config.YOUTUBE_PROXY:
+        logger.info("  - YouTube Egress Proxy: Enabled")
+        proxy_status = await asyncio.to_thread(check_proxy, config.YOUTUBE_PROXY)
+        logger.info("YouTube proxy check: %s", proxy_status)
     logger.info("  - Web Port (Render): %d", config.PORT)
     runtimes = get_js_runtimes()
     if runtimes:
         logger.info("  - YouTube JS runtime: Deno at %s", runtimes["deno"]["path"])
     else:
         logger.warning("YouTube JS runtime missing: install requirements.txt before downloading videos")
-
-    if config.YOUTUBE_PROXY:
-        proxy_status = await asyncio.to_thread(check_proxy, config.YOUTUBE_PROXY)
-        logger.info("YouTube proxy check: %s", proxy_status)
 
     # Ensure downloads directory exists
     os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)

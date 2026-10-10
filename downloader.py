@@ -54,13 +54,14 @@ class _YtdlpLogger:
     @staticmethod
     def _redact(message):
         from urllib.parse import urlsplit
-        proxy = config.YOUTUBE_PROXY
-        if proxy:
-            message = message.replace(proxy, "[proxy]")
-            parsed = urlsplit(proxy)
-            for secret in (parsed.username, parsed.password):
-                if secret:
-                    message = message.replace(secret, "[redacted]")
+        proxies = getattr(config, "YOUTUBE_PROXIES", []) or ([config.YOUTUBE_PROXY] if config.YOUTUBE_PROXY else [])
+        for proxy in proxies:
+            if proxy:
+                message = message.replace(proxy, "[proxy]")
+                parsed = urlsplit(proxy)
+                for secret in (parsed.username, parsed.password):
+                    if secret:
+                        message = message.replace(secret, "[redacted]")
         return message
 
 

@@ -38,9 +38,23 @@ BUFFER_SIZE = int(os.getenv("BUFFER_SIZE", str(1024 * 1024)))  # 1 MB I/O buffer
 HTTP_CHUNK_SIZE = int(os.getenv("HTTP_CHUNK_SIZE", str(10 * 1024 * 1024)))  # 10 MB HTTP chunks
 COOKIES_FILE = os.getenv("COOKIES_FILE", os.path.abspath("cookies.txt") if os.path.exists("cookies.txt") else "")
 COOKIES_DATA = os.getenv("COOKIES_DATA", os.getenv("YOUTUBE_COOKIES", ""))
-# Optional authenticated egress proxy for YouTube. This is useful when a cloud
-# provider's datacenter IP is blocked while the account cookies are valid.
-YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip()
+def parse_proxy_list(raw: str) -> list[str]:
+    """Parse comma, semicolon, or newline-separated proxy URLs from environment."""
+    if not raw:
+        return []
+    import re
+    tokens = re.split(r"[,;\n\r]+", raw)
+    proxies = []
+    for token in tokens:
+        cleaned = token.strip().strip("'\"")
+        if cleaned:
+            proxies.append(cleaned)
+    return proxies
+
+# Optional authenticated egress proxy for YouTube. Supports single proxy or comma-separated list.
+YOUTUBE_PROXY_RAW = os.getenv("YOUTUBE_PROXY", "").strip()
+YOUTUBE_PROXIES = parse_proxy_list(YOUTUBE_PROXY_RAW)
+YOUTUBE_PROXY = YOUTUBE_PROXIES[0] if YOUTUBE_PROXIES else ""
 # Media downloads never use this proxy; no media fallback is permitted.
 
 # Auto-generate cookies.txt from environment variable (supports raw text or base64)

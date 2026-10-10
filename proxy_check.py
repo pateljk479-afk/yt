@@ -35,54 +35,149 @@ def _next_session(proxy_url: str) -> str:
     return proxy._replace(netloc=username + colon + password + "@" + endpoint).geturl()
 
 
-def run_with_proxy_recovery(operation, options: dict):
-    """Retry an operation only when BusyIP confirms its sticky exit is offline.
+def _redact_proxy(proxy_url: str) -> str:
+    """Safely redact credentials from a proxy URL for logging."""
+    if not proxy_url:
+        return ""
+    try:
+        parsed = urlsplit(proxy_url)
+        username = parsed.username or ""
+        password = parsed.password or ""
+        redacted = proxy_url
+        if username:
+            redacted = redacted.replace(username, "[user]")
+        if password:
+            redacted = redacted.replace(password, "[redacted]")
+        return redacted
+    except Exception:
+        return "[proxy]"
 
+
+def is_proxy_failure(exc: Exception) -> bool:
+    """Detect if an exception is caused by proxy tunnel or connection failure."""
+    message = str(exc).lower()
+    return (
+        "sticky_device_offline" in message
+        or "tunnel connection failed" in message
+        or "unable to connect to proxy" in message
+        or "proxyerror" in message
+        or "proxy error" in message
+        or "proxy refused" in message
+        or "cannot connect to proxy" in message
+        or "connection refused" in message
+        or "failed to establish a new connection" in message
+        or ("proxy" in message and ("403" in message or "407" in message or "502" in message or "503" in message or "504" in message or "tunnel" in message))
+        or "playlists that require authentication may not extract correctly" in message
+    )
+
+
+def run_with_proxy_recovery(operation, options: dict):
+    """Retry an operation across multiple configured proxies or with BusyIP session recovery.
+
+    If a proxy fails (tunnel 403, offline, etc.), it tests and rotates through
+    all available proxies in YOUTUBE_PROXIES until a healthy one is found.
     New selections are shared across workers for the lifetime of the process.
-    The hosting-panel value remains the starting session after a restart.
     """
     import config
 
     options = dict(options)
-    rotations = 0
+    tried_proxies = set()
+    initial_proxy = options.get("proxy", "")
+    if initial_proxy:
+        tried_proxies.add(initial_proxy)
+
+    session_rotations = 0
+
     while True:
         try:
             return operation(options)
         except Exception as exc:
             failed_proxy = options.get("proxy", "")
-            message = str(exc).lower()
-            proxy_failure = "sticky_device_offline" in message or (
-                "proxy" in message and ("403" in message or "tunnel connection failed" in message)
-            ) or "playlists that require authentication may not extract correctly" in message
-            if not failed_proxy or urlsplit(failed_proxy).hostname != "gate.busyip.com" or not proxy_failure:
+            if not failed_proxy or not is_proxy_failure(exc):
                 raise
+
             with _session_lock:
-                # Another download may already have recovered this session.
-                if config.YOUTUBE_PROXY and config.YOUTUBE_PROXY != failed_proxy:
+                # 1. Check if another concurrent worker has already switched to a new proxy
+                if config.YOUTUBE_PROXY and config.YOUTUBE_PROXY != failed_proxy and config.YOUTUBE_PROXY not in tried_proxies:
                     options["proxy"] = config.YOUTUBE_PROXY
-                    rotations += 1
-                    if rotations > MAX_SESSION_RETRIES:
-                        raise ProxyRecoveryError("Proxy recovery retry limit reached.") from exc
+                    tried_proxies.add(config.YOUTUBE_PROXY)
+                    logger.info("Using proxy %s recovered by another worker", _redact_proxy(config.YOUTUBE_PROXY))
                     continue
-                status = check_proxy(failed_proxy)
-                if "sticky_device_offline" not in status:
-                    # A 403 can also mean bad credentials, exhausted credit or
-                    # denied access. Changing session does not fix those errors.
-                    raise
-                while rotations < MAX_SESSION_RETRIES:
-                    failed_proxy = _next_session(failed_proxy)
-                    rotations += 1
-                    logger.warning("BusyIP sticky exit offline; testing next session (%d/%d)", rotations, MAX_SESSION_RETRIES)
+
+                # 2. Check if we have multiple proxies in the configured pool
+                pool = getattr(config, "YOUTUBE_PROXIES", [])
+                if not pool and config.YOUTUBE_PROXY:
+                    pool = [config.YOUTUBE_PROXY]
+
+                candidate_found = False
+                if len(pool) > 1:
+                    # Find candidate proxies in the pool that haven't been tried yet
+                    start_idx = (pool.index(failed_proxy) + 1) if failed_proxy in pool else 0
+                    for offset in range(len(pool)):
+                        candidate = pool[(start_idx + offset) % len(pool)]
+                        if candidate in tried_proxies:
+                            continue
+                        tried_proxies.add(candidate)
+                        logger.warning("Proxy %s failed; testing candidate from pool: %s", _redact_proxy(failed_proxy), _redact_proxy(candidate))
+                        status = check_proxy(candidate)
+                        if status == "CONNECT HTTP 200" or status.startswith("CONNECT diagnostic"):
+                            config.YOUTUBE_PROXY = candidate
+                            options["proxy"] = candidate
+                            logger.info("Switching to healthy pool proxy: %s", _redact_proxy(candidate))
+                            candidate_found = True
+                            break
+                        else:
+                            logger.warning("Pool proxy %s returned %s; continuing search...", _redact_proxy(candidate), status)
+
+                    # If diagnostic didn't return 200 for any, but there are unattempted pool candidates, try next directly
+                    if not candidate_found and len(tried_proxies) < len(pool):
+                        for offset in range(len(pool)):
+                            candidate = pool[(start_idx + offset) % len(pool)]
+                            if candidate not in tried_proxies:
+                                tried_proxies.add(candidate)
+                                config.YOUTUBE_PROXY = candidate
+                                options["proxy"] = candidate
+                                logger.info("Retrying with next pool proxy directly: %s", _redact_proxy(candidate))
+                                candidate_found = True
+                                break
+
+                    if candidate_found:
+                        continue
+
+                # 3. BusyIP sticky exit recovery (if using BusyIP proxy)
+                if urlsplit(failed_proxy).hostname == "gate.busyip.com":
                     status = check_proxy(failed_proxy)
-                    if status == "CONNECT HTTP 200":
-                        config.YOUTUBE_PROXY = failed_proxy
-                        options["proxy"] = failed_proxy
-                        logger.info("BusyIP replacement session connected; retrying YouTube request")
-                        break
-                    if "sticky_device_offline" not in status:
-                        raise ProxyRecoveryError("Replacement proxy session failed: " + status) from exc
-                else:
-                    raise ProxyRecoveryError("No online BusyIP sticky exit found after 5 session retries.") from exc
+                    if "sticky_device_offline" in status:
+                        while session_rotations < MAX_SESSION_RETRIES:
+                            failed_proxy = _next_session(failed_proxy)
+                            session_rotations += 1
+                            logger.warning(
+                                "BusyIP sticky exit offline; testing next session (%d/%d)",
+                                session_rotations,
+                                MAX_SESSION_RETRIES,
+                            )
+                            status = check_proxy(failed_proxy)
+                            if status == "CONNECT HTTP 200":
+                                config.YOUTUBE_PROXY = failed_proxy
+                                options["proxy"] = failed_proxy
+                                logger.info("BusyIP replacement session connected; retrying YouTube request")
+                                candidate_found = True
+                                break
+                            if "sticky_device_offline" not in status:
+                                raise ProxyRecoveryError("Replacement proxy session failed: " + status) from exc
+                        if not candidate_found:
+                            raise ProxyRecoveryError("No online BusyIP sticky exit found after 5 session retries.") from exc
+                        continue
+                    else:
+                        # Non-recoverable BusyIP error (e.g. invalid credentials) with single proxy
+                        if len(pool) <= 1:
+                            raise
+
+                # 4. If all pool proxies were tried and exhausted
+                if len(pool) > 1 and len(tried_proxies) >= len(pool):
+                    raise ProxyRecoveryError(f"All {len(pool)} configured proxies failed.") from exc
+
+                raise
 
 
 def check_proxy(proxy_url: str) -> str:
