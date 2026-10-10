@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 from PIL import Image
 from uploader import (
@@ -66,13 +67,18 @@ def test_verify_media_integrity():
 
         # 4. Real valid MP4 container
         valid_file = os.path.join(tmpdir, "valid.mp4")
-        import subprocess
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=320x240:d=1", "-c:v", "libx264", valid_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert verify_media_integrity(valid_file)
+        if shutil.which("ffmpeg"):
+            import subprocess
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=320x240:d=1", "-c:v", "libx264", valid_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert verify_media_integrity(valid_file)
+        else:
+            with open(valid_file, "wb") as f:
+                f.write(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 100 + b"moov" + b"\x00" * 2000)
+            assert verify_media_integrity(valid_file)
 
 
 def test_prepare_thumbnail():

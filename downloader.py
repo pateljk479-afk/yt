@@ -209,31 +209,50 @@ def get_cookiefile_path() -> Optional[str]:
 
 
 def extract_info(url: str, is_playlist: bool = False) -> dict:
-    """Extract YouTube metadata synchronously via yt-dlp."""
+    """Extract YouTube metadata synchronously via yt-dlp with multi-tier fallback."""
     # Clean URL if single video
-    clean_url = url
-    if not is_playlist and ("watch?v=" in url or "youtu.be/" in url):
+    clean_url = url.strip()
+    if not is_playlist and ("watch?v=" in clean_url or "youtu.be/" in clean_url):
         # Strip list parameter if single video was requested
         clean_url = re.sub(r"&list=[^&]+", "", clean_url)
         clean_url = re.sub(r"\?list=[^&]+&", "?", clean_url)
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": not is_playlist,
-        "remote_components": ["ejs:github"],
-    }
     cookies_path = get_cookiefile_path()
-    if cookies_path:
-        ydl_opts["cookiefile"] = cookies_path
-        
-    if is_playlist:
-        ydl_opts["extract_flat"] = "in_playlist"
-        
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(clean_url, download=False)
-        return info
+
+    def _get_opts(use_cookies: bool = True):
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": not is_playlist,
+            "remote_components": ["ejs:github"],
+            "extractor_args": {
+                "youtube": {
+                    "player_skip": ["tv", "tv_downgraded"]
+                }
+            }
+        }
+        if use_cookies and cookies_path:
+            opts["cookiefile"] = cookies_path
+        if is_playlist:
+            opts["extract_flat"] = "in_playlist"
+        return opts
+
+    # Tier 1: Try with cookies if present
+    try:
+        with yt_dlp.YoutubeDL(_get_opts(use_cookies=True)) as ydl:
+            return ydl.extract_info(clean_url, download=False)
+    except Exception as e1:
+        logger.warning("Primary metadata extraction failed for %s: %s", clean_url, e1)
+        # Tier 2: If cookies caused issue, retry without cookies
+        if cookies_path:
+            try:
+                logger.info("Retrying extraction without cookies for %s...", clean_url)
+                with yt_dlp.YoutubeDL(_get_opts(use_cookies=False)) as ydl:
+                    return ydl.extract_info(clean_url, download=False)
+            except Exception as e2:
+                logger.warning("Fallback extraction without cookies failed: %s", e2)
+        raise e1
 
 
 def build_ydl_options(
@@ -241,6 +260,7 @@ def build_ydl_options(
     format_selector: str,
     progress_hook: Optional[Callable] = None,
     is_audio: bool = False,
+    use_cookies: bool = True,
 ) -> dict:
     """Construct optimized yt-dlp options maximizing speed for 600 Mbps server."""
     out_tmpl = os.path.join(target_dir, "%(title)s.%(ext)s")
@@ -260,9 +280,15 @@ def build_ydl_options(
         "ignoreerrors": False,
         "logtostderr": False,
         "remote_components": ["ejs:github"],
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["default", "web", "android"],
+                "player_skip": ["tv", "tv_downgraded"]
+            }
+        }
     }
     cookies_path = get_cookiefile_path()
-    if cookies_path:
+    if use_cookies and cookies_path:
         opts["cookiefile"] = cookies_path
     
     if is_audio:
@@ -345,10 +371,52 @@ def download_media(
         format_selector=format_selector,
         progress_hook=progress_hook,
         is_audio=is_audio,
+        use_cookies=True,
     )
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as err:
+        err_msg = str(err)
+        logger.warning("Primary download attempt failed for %s: %s", url, err_msg)
+        # Fallback 1: If cookies caused 'The page needs to be reloaded' or format error, retry without cookies
+        if get_cookiefile_path() and ("The page needs to be reloaded" in err_msg or "Sign in to confirm" in err_msg or "Requested format is not available" in err_msg):
+            logger.info("Retrying download without cookies for %s...", url)
+            ydl_opts_nocookies = build_ydl_options(
+                target_dir=temp_dir,
+                format_selector=format_selector,
+                progress_hook=progress_hook,
+                is_audio=is_audio,
+                use_cookies=False,
+            )
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts_nocookies) as ydl_nc:
+                    info = ydl_nc.extract_info(url, download=True)
+            except Exception as err2:
+                logger.warning("Secondary download attempt failed: %s. Retrying with generic format selector...", err2)
+                fallback_format = "ba/b" if is_audio else "bv*+ba/b/best"
+                ydl_opts_generic = build_ydl_options(
+                    target_dir=temp_dir,
+                    format_selector=fallback_format,
+                    progress_hook=progress_hook,
+                    is_audio=is_audio,
+                    use_cookies=False,
+                )
+                with yt_dlp.YoutubeDL(ydl_opts_generic) as ydl_gen:
+                    info = ydl_gen.extract_info(url, download=True)
+        else:
+            logger.info("Retrying with generic format selector for %s...", url)
+            fallback_format = "ba/b" if is_audio else "bv*+ba/b/best"
+            ydl_opts_generic = build_ydl_options(
+                target_dir=temp_dir,
+                format_selector=fallback_format,
+                progress_hook=progress_hook,
+                is_audio=is_audio,
+                use_cookies=True,
+            )
+            with yt_dlp.YoutubeDL(ydl_opts_generic) as ydl_gen:
+                info = ydl_gen.extract_info(url, download=True)
         
     title = info.get("title", "video")
     duration = int(info.get("duration") or 0)

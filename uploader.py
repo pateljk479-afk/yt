@@ -87,6 +87,13 @@ def verify_media_integrity(file_path: str, is_audio: bool = False) -> bool:
                 if b"ftyp" not in header:
                     logger.error("MP4 header missing 'ftyp' signature: %s", file_path)
                     return False
+                # If ffprobe is not available, check for basic atom presence in body
+                if size > 2000 and not shutil.which("ffprobe"):
+                    f.seek(0)
+                    body = f.read(min(size, 8192))
+                    if b"moov" not in body and b"mdat" not in body and b"free" not in body:
+                        logger.error("MP4 file missing essential container atoms: %s", file_path)
+                        return False
         except Exception as e:
             logger.error("Error reading file header: %s", e)
             return False

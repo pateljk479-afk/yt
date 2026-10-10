@@ -2,8 +2,14 @@
 pyrogram>=2.0.106
 tgcrypto>=1.2.5
 
-# YouTube & Media Processing
-yt-dlp>=2026.8.0
+# YouTube & Media Processing with Embedded JS Solver & TLS Spoofing
+yt-dlp[default]>=2026.8.0
+yt-dlp-ejs>=0.8.0
+deno>=2.6.0
+curl-cffi>=0.16.0
+pycryptodomex>=3.20.0
+brotli>=1.1.0
+mutagen>=1.47.0
 pillow>=10.0.0
 
 # Asynchronous HTTP & Cloud Health Check
