@@ -42,6 +42,10 @@ async def main():
     logger.info("  - Max Concurrent Downloads: %d", config.MAX_CONCURRENT_DOWNLOADS)
     logger.info("  - Fragment Parallel Streams: %d", config.CONCURRENT_FRAGMENT_DOWNLOADS)
     logger.info("  - aria2c Accelerated Downloader: %s", "Enabled" if config.ARIA2C_AVAILABLE else "Disabled (yt-dlp native multithread)")
+    if config.COOKIES_FILE and os.path.exists(config.COOKIES_FILE):
+        logger.info("  - YouTube Cookies: Active (%s, %.1f KB)", os.path.basename(config.COOKIES_FILE), os.path.getsize(config.COOKIES_FILE) / 1024)
+    else:
+        logger.info("  - YouTube Cookies: None configured (optional)")
     if getattr(config, "YOUTUBE_PROXIES", None):
         logger.info("  - YouTube Egress Proxy: Enabled (%d proxies configured in pool)", len(config.YOUTUBE_PROXIES))
         for idx, p in enumerate(config.YOUTUBE_PROXIES, 1):
