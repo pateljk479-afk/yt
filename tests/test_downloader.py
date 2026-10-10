@@ -159,6 +159,40 @@ def test_build_ydl_options_uses_configured_youtube_proxy(monkeypatch):
     assert opts["proxy"] == "http://proxy.example:8080"
 
 
+def test_playlist_authcheck_failure_retries_with_credentials(monkeypatch):
+    from downloader import extract_info
+    from yt_dlp.utils import DownloadError
+
+    monkeypatch.setattr(config, "YOUTUBE_PROXY", "http://proxy.example:8080")
+    result = {"entries": [{"id": "example"}]}
+    with patch("downloader.get_cookiefile_path", return_value="/tmp/cookies.txt"), \
+         patch("downloader.yt_dlp.YoutubeDL") as factory:
+        factory.return_value.__enter__.return_value.extract_info.side_effect = [
+            DownloadError("Playlists that require authentication may not extract correctly without a successful webpage download"),
+            result,
+        ]
+        assert extract_info("https://youtube.com/playlist?list=PLexample", True) == result
+
+    initial, retry = [call.args[0] for call in factory.call_args_list]
+    assert "youtubetab" not in initial["extractor_args"]
+    assert retry["extractor_args"]["youtubetab"] == {"skip": ["authcheck"]}
+    assert retry["cookiefile"] == initial["cookiefile"] == "/tmp/cookies.txt"
+    assert retry["proxy"] == initial["proxy"]
+    assert retry["extractor_args"]["youtube"] == initial["extractor_args"]["youtube"]
+
+
+def test_playlist_unrelated_failure_is_not_retried():
+    from downloader import extract_info
+    from yt_dlp.utils import DownloadError
+
+    with patch("downloader.get_cookiefile_path", return_value=None), \
+         patch("downloader.yt_dlp.YoutubeDL") as factory:
+        factory.return_value.__enter__.return_value.extract_info.side_effect = DownloadError("This playlist does not exist")
+        with pytest.raises(DownloadError, match="does not exist"):
+            extract_info("https://youtube.com/playlist?list=PLexample", True)
+        assert factory.call_count == 1
+
+
 def test_validate_youtube_cookie_file_requires_a_signed_in_session(tmp_path):
     cookie_file = tmp_path / "cookies.txt"
     cookie_file.write_text(

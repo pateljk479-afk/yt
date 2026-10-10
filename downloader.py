@@ -291,7 +291,7 @@ def get_cookiefile_path() -> Optional[str]:
 
 
 def extract_info(url: str, is_playlist: bool = False) -> dict:
-    """Extract YouTube metadata synchronously via yt-dlp with multi-tier fallback."""
+    """Extract metadata, with a targeted playlist API fallback."""
     # Clean URL if single video
     clean_url = url.strip()
     if not is_playlist and ("watch?v=" in clean_url or "youtu.be/" in clean_url):
@@ -304,7 +304,8 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
     def _get_opts(use_cookies: bool = True):
         opts = {
             "quiet": True,
-            "no_warnings": True,
+            "no_warnings": False,
+            "nocolor": True,
             "skip_download": True,
             "noplaylist": not is_playlist,
             "remote_components": ["ejs:github"],
@@ -330,7 +331,18 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
             return ydl.extract_info(clean_url, download=False)
     except Exception as e1:
         logger.warning("Primary metadata extraction failed for %s: %s", clean_url, e1)
-        raise e1
+        # The tab extractor blocks its browse-API fallback when cookies exist
+        # but the initial page did not supply account configuration. Only opt
+        # out after this specific guard fails; preserve cookies and the proxy.
+        # Private playlists on a secondary account/channel may still need the
+        # initial page's account configuration and are not guaranteed to work.
+        if is_playlist and "Playlists that require authentication may not extract correctly" in str(e1):
+            opts = _get_opts(use_cookies=True)
+            opts.setdefault("extractor_args", {})["youtubetab"] = {"skip": ["authcheck"]}
+            logger.warning("Retrying playlist via YouTube API with authcheck skipped; keeping cookies and egress settings")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(clean_url, download=False)
+        raise
 
 
 def build_ydl_options(
