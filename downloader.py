@@ -3,6 +3,8 @@ import re
 import tempfile
 import logging
 import time
+import shutil
+import sysconfig
 from http.cookiejar import MozillaCookieJar
 from dataclasses import dataclass
 from typing import Optional, Callable, List, Tuple
@@ -14,7 +16,67 @@ from proxy_check import run_with_proxy_recovery, ProxyRecoveryError
 logger = logging.getLogger(__name__)
 
 
+def get_js_runtimes() -> dict:
+    """Find pip-installed Deno even when user scripts are absent from PATH."""
+    deno_name = "deno.exe" if os.name == "nt" else "deno"
+    candidates = [shutil.which("deno")]
+    for scheme in (sysconfig.get_default_scheme(), sysconfig.get_preferred_scheme("user")):
+        candidates.append(os.path.join(sysconfig.get_path("scripts", scheme=scheme), deno_name))
+    # Also covers pip --target installations using the deno package's resolver.
+    try:
+        from deno._find_deno import find_deno_bin
+        candidates.append(find_deno_bin())
+    except (ImportError, OSError):
+        pass
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return {"deno": {"path": os.path.abspath(candidate)}}
+    return {}
+
+
+class _YtdlpLogger:
+    """Keep solver diagnostics visible without dumping credentials or URLs."""
+
+    def debug(self, message):
+        if any(marker in message for marker in (
+            "JS runtimes:", "[jsc]", "[jsc:deno]", "playability status:",
+        )):
+            logger.info("yt-dlp: %s", message)
+
+    def warning(self, message):
+        logger.warning("yt-dlp: %s", self._redact(message))
+
+    def error(self, message):
+        logger.error("yt-dlp: %s", self._redact(message))
+
+    @staticmethod
+    def _redact(message):
+        from urllib.parse import urlsplit
+        proxy = config.YOUTUBE_PROXY
+        if proxy:
+            message = message.replace(proxy, "[proxy]")
+            parsed = urlsplit(proxy)
+            for secret in (parsed.username, parsed.password):
+                if secret:
+                    message = message.replace(secret, "[redacted]")
+        return message
+
+
 def _extract_with_recovery(url: str, options: dict, download: bool) -> dict:
+    options = dict(options)
+    runtimes = get_js_runtimes()
+    if not runtimes and not options.get("extract_flat"):
+        raise RuntimeError(
+            "YouTube playback requires Deno, but its executable was not found. "
+            "Install the server dependencies with python -m pip install -U -r requirements.txt."
+        )
+    options.update({
+        "js_runtimes": runtimes,
+        "verbose": True,
+        "logger": _YtdlpLogger(),
+        "no_warnings": False,
+        "nocolor": True,
+    })
     def operation(attempt_options):
         with yt_dlp.YoutubeDL(attempt_options) as ydl:
             return ydl.extract_info(url, download=download)
@@ -365,7 +427,8 @@ def build_ydl_options(
         "format": format_selector,
         "outtmpl": out_tmpl,
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
+        "nocolor": True,
         "retries": 10,
         "fragment_retries": 10,
         "buffersize": config.BUFFER_SIZE,

@@ -11,6 +11,28 @@ from downloader import (
 import config
 
 
+def test_playback_uses_explicit_runtime_and_visible_solver_logs():
+    import downloader
+    runtime = {"deno": {"path": "/home/container/.local/bin/deno"}}
+    with patch.object(downloader, "get_js_runtimes", return_value=runtime), \
+         patch.object(downloader, "run_with_proxy_recovery", return_value={"id": "video"}) as recovery:
+        assert downloader._extract_with_recovery("https://youtube.com/watch?v=video", {}, False) == {"id": "video"}
+    options = recovery.call_args.args[1]
+    assert options["js_runtimes"] == runtime
+    assert options["no_warnings"] is False
+    assert options["nocolor"] is True
+    assert options["verbose"] is True
+
+
+def test_missing_runtime_stops_playback_with_actionable_error():
+    import downloader
+    with patch.object(downloader, "get_js_runtimes", return_value={}), \
+         patch.object(downloader, "run_with_proxy_recovery") as recovery:
+        with pytest.raises(RuntimeError, match="requires Deno"):
+            downloader._extract_with_recovery("https://youtube.com/watch?v=video", {}, True)
+        recovery.assert_not_called()
+
+
 def test_sanitize_filename():
     raw_name = 'My: Cool? "Video" / With <Illegal> *Chars* | & More'
     sanitized = sanitize_filename(raw_name)

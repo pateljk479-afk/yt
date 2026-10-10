@@ -9,6 +9,7 @@ from bot import app
 from web import start_web_server
 from uploader import safe_cleanup
 from proxy_check import check_proxy
+from downloader import get_js_runtimes
 
 # Configure structured logging
 logging.basicConfig(
@@ -43,6 +44,11 @@ async def main():
     logger.info("  - aria2c Accelerated Downloader: %s", "Enabled" if config.ARIA2C_AVAILABLE else "Disabled (yt-dlp native multithread)")
     logger.info("  - YouTube Egress Proxy: %s", "Enabled" if config.YOUTUBE_PROXY else "Disabled (cloud IP used)")
     logger.info("  - Web Port (Render): %d", config.PORT)
+    runtimes = get_js_runtimes()
+    if runtimes:
+        logger.info("  - YouTube JS runtime: Deno at %s", runtimes["deno"]["path"])
+    else:
+        logger.warning("YouTube JS runtime missing: install requirements.txt before downloading videos")
 
     if config.YOUTUBE_PROXY:
         proxy_status = await asyncio.to_thread(check_proxy, config.YOUTUBE_PROXY)
