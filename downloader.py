@@ -318,6 +318,8 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
             opts["extractor_args"] = {
                 "youtube": {"player_client": ["default", "web_embedded"]}
             }
+        if config.YOUTUBE_PROXY:
+            opts["proxy"] = config.YOUTUBE_PROXY
         if is_playlist:
             opts["extract_flat"] = "in_playlist"
         return opts
@@ -365,6 +367,8 @@ def build_ydl_options(
         opts["extractor_args"] = {
             "youtube": {"player_client": ["default", "web_embedded"]}
         }
+    if config.YOUTUBE_PROXY:
+        opts["proxy"] = config.YOUTUBE_PROXY
     
     if is_audio:
         opts["format"] = "ba/b"

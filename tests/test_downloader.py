@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import patch
 from downloader import (
     sanitize_filename,
     estimate_audio_size,
@@ -129,8 +130,6 @@ def test_analyze_video_qualities_under_limit():
 
 
 def test_build_ydl_options():
-    from unittest.mock import patch
-
     with patch("downloader.get_cookiefile_path", return_value=None):
         opts = build_ydl_options("/tmp/test", "bv*[height<=1080]+ba/b", is_audio=False)
 
@@ -145,13 +144,19 @@ def test_build_ydl_options():
 
 
 def test_build_ydl_options_uses_cookie_safe_player_clients():
-    from unittest.mock import patch
-
     with patch("downloader.get_cookiefile_path", return_value="/tmp/cookies.txt"):
         opts = build_ydl_options("/tmp/test", "bv*[height<=1080]+ba/b", is_audio=False)
 
     assert opts["cookiefile"] == "/tmp/cookies.txt"
     assert opts["extractor_args"]["youtube"]["player_client"] == ["default", "web_embedded"]
+
+
+def test_build_ydl_options_uses_configured_youtube_proxy(monkeypatch):
+    monkeypatch.setattr(config, "YOUTUBE_PROXY", "http://proxy.example:8080")
+    with patch("downloader.get_cookiefile_path", return_value=None):
+        opts = build_ydl_options("/tmp/test", "best", is_audio=False)
+
+    assert opts["proxy"] == "http://proxy.example:8080"
 
 
 def test_validate_youtube_cookie_file_requires_a_signed_in_session(tmp_path):

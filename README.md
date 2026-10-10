@@ -83,6 +83,7 @@ cp .env.example .env
 | `DOWNLOAD_DIR` | Directory for temporary video and thumbnail files | `./downloads` |
 | `CONCURRENT_FRAGMENT_DOWNLOADS` | Number of parallel fragment downloads | `16` |
 | `MAX_CONCURRENT_DOWNLOADS` | Max simultaneous video downloads | `3` |
+| `YOUTUBE_PROXY` | Optional `http://user:pass@host:port` or `socks5://host:port` egress proxy for YouTube | *(unset)* |
 | `PORT` | HTTP port for cloud health check (Render `$PORT`) | `8080` |
 | `ENABLE_WEB_SERVER` | Enable health check web server | `true` |
 

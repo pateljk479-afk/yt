@@ -40,6 +40,7 @@ async def main():
     logger.info("  - Max Concurrent Downloads: %d", config.MAX_CONCURRENT_DOWNLOADS)
     logger.info("  - Fragment Parallel Streams: %d", config.CONCURRENT_FRAGMENT_DOWNLOADS)
     logger.info("  - aria2c Accelerated Downloader: %s", "Enabled" if config.ARIA2C_AVAILABLE else "Disabled (yt-dlp native multithread)")
+    logger.info("  - YouTube Egress Proxy: %s", "Enabled" if config.YOUTUBE_PROXY else "Disabled (cloud IP used)")
     logger.info("  - Web Port (Render): %d", config.PORT)
 
     # Ensure downloads directory exists
