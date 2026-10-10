@@ -12,6 +12,7 @@ import yt_dlp
 
 import config
 from proxy_check import run_with_proxy_recovery, ProxyRecoveryError
+from media_routing import install_media_routing
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ def _extract_with_recovery(url: str, options: dict, download: bool) -> dict:
     })
     def operation(attempt_options):
         with yt_dlp.YoutubeDL(attempt_options) as ydl:
+            if attempt_options.get("proxy"):
+                install_media_routing(ydl)
             return ydl.extract_info(url, download=download)
     return run_with_proxy_recovery(operation, options)
 
@@ -467,7 +470,12 @@ def build_ydl_options(
         }
         
     # Use aria2c if available on the system
-    if config.ARIA2C_AVAILABLE:
+    # External downloaders bypass our per-request direct/proxy routing.
+    # Native HTTP/HLS/DASH still supports concurrent fragment downloads.
+    if config.YOUTUBE_PROXY:
+        opts["hls_prefer_native"] = True
+        opts["external_downloader"] = {"default": "native"}
+    elif config.ARIA2C_AVAILABLE:
         opts["external_downloader"] = "aria2c"
         opts["external_downloader_args"] = [
             "-x", "16",

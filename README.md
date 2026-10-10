@@ -169,6 +169,22 @@ python main.py
 
 ## 🧪 Running the Test Suite
 
+### Minimizing paid YouTube proxy traffic
+
+With `YOUTUBE_PROXY` configured, YouTube metadata uses the proxy, but video,
+audio and thumbnails ALWAYS use direct server connections. Native
+yt-dlp downloading is used instead of aria2 so request routing is enforced.
+Logs report direct routing. Telegram uploads and local FFmpeg merging do not
+use this proxy.
+
+Media proxy fallback has been removed entirely. Any old
+`YOUTUBE_MEDIA_PROXY_FALLBACK` environment value is ignored, even `true`.
+If YouTube rejects a direct media request, the download fails without retrying
+through the paid proxy. Metadata still consumes proxy data.
+Live streams requiring networked FFmpeg are rejected while the proxy is enabled,
+because that downloader bypasses per-request routing. Local merging is unaffected.
+Upload the updated Python files and restart the server to apply these changes.
+
 Run all automated unit and integration tests with `pytest`:
 
 ```bash

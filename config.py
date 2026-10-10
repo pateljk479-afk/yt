@@ -34,6 +34,7 @@ COOKIES_DATA = os.getenv("COOKIES_DATA", os.getenv("YOUTUBE_COOKIES", ""))
 # Optional authenticated egress proxy for YouTube. This is useful when a cloud
 # provider's datacenter IP is blocked while the account cookies are valid.
 YOUTUBE_PROXY = os.getenv("YOUTUBE_PROXY", "").strip()
+# Media downloads never use this proxy; no media fallback is permitted.
 
 # Auto-generate cookies.txt from environment variable (supports raw text or base64)
 if COOKIES_DATA:
