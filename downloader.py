@@ -9,8 +9,16 @@ from typing import Optional, Callable, List, Tuple
 import yt_dlp
 
 import config
+from proxy_check import run_with_proxy_recovery, ProxyRecoveryError
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_with_recovery(url: str, options: dict, download: bool) -> dict:
+    def operation(attempt_options):
+        with yt_dlp.YoutubeDL(attempt_options) as ydl:
+            return ydl.extract_info(url, download=download)
+    return run_with_proxy_recovery(operation, options)
 
 # Standard resolution tiers and user-facing labels
 RESOLUTION_TIERS = [
@@ -327,8 +335,7 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
 
     # Tier 1: Try with cookies if present
     try:
-        with yt_dlp.YoutubeDL(_get_opts(use_cookies=True)) as ydl:
-            return ydl.extract_info(clean_url, download=False)
+        return _extract_with_recovery(clean_url, _get_opts(use_cookies=True), False)
     except Exception as e1:
         logger.warning("Primary metadata extraction failed for %s: %s", clean_url, e1)
         # The tab extractor blocks its browse-API fallback when cookies exist
@@ -340,8 +347,7 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
             opts = _get_opts(use_cookies=True)
             opts.setdefault("extractor_args", {})["youtubetab"] = {"skip": ["authcheck"]}
             logger.warning("Retrying playlist via YouTube API with authcheck skipped; keeping cookies and egress settings")
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(clean_url, download=False)
+            return _extract_with_recovery(clean_url, opts, False)
         raise
 
 
@@ -466,9 +472,10 @@ def download_media(
     )
     
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        info = _extract_with_recovery(url, ydl_opts, True)
     except Exception as err:
+        if isinstance(err, ProxyRecoveryError):
+            raise
         err_msg = str(err)
         logger.warning("Primary download attempt failed for %s: %s", url, err_msg)
         # A format-selection error can be retried without cookies. Authentication
@@ -484,9 +491,10 @@ def download_media(
                 use_cookies=False,
             )
             try:
-                with yt_dlp.YoutubeDL(ydl_opts_nocookies) as ydl_nc:
-                    info = ydl_nc.extract_info(url, download=True)
+                info = _extract_with_recovery(url, ydl_opts_nocookies, True)
             except Exception as err2:
+                if isinstance(err2, ProxyRecoveryError):
+                    raise
                 logger.warning("Secondary download attempt failed: %s. Retrying with generic format selector...", err2)
                 fallback_format = "ba/b" if is_audio else "bv*+ba/b/best"
                 ydl_opts_generic = build_ydl_options(
@@ -496,8 +504,7 @@ def download_media(
                     is_audio=is_audio,
                     use_cookies=False,
                 )
-                with yt_dlp.YoutubeDL(ydl_opts_generic) as ydl_gen:
-                    info = ydl_gen.extract_info(url, download=True)
+                info = _extract_with_recovery(url, ydl_opts_generic, True)
         else:
             logger.info("Retrying with generic format selector for %s...", url)
             fallback_format = "ba/b" if is_audio else "bv*+ba/b/best"
@@ -508,8 +515,7 @@ def download_media(
                 is_audio=is_audio,
                 use_cookies=True,
             )
-            with yt_dlp.YoutubeDL(ydl_opts_generic) as ydl_gen:
-                info = ydl_gen.extract_info(url, download=True)
+            info = _extract_with_recovery(url, ydl_opts_generic, True)
         
     title = info.get("title", "video")
     duration = int(info.get("duration") or 0)
