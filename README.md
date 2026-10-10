@@ -138,7 +138,11 @@ python main.py
 3. User navigates with `Next ➡️` / `⬅️ Prev` or clicks `✅ Select All`.
 4. User clicks `📥 Download Selected (N)`.
 5. User selects desired quality.
-6. Bot downloads and sends each video sequentially.
+6. Bot uploads each completed video while downloading the next selected video.
+   Upload order is preserved, with at most one next video prefetched per playlist.
+   Each file finishes downloading, merging and verification before its upload;
+   single-video downloads retain that safe sequence. Progress-bar edits are
+   at least five seconds apart (`PROGRESS_UPDATE_INTERVAL`, minimum 5).
 
 ---
 

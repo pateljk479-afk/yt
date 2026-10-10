@@ -142,7 +142,9 @@ async def test_playlist_batch_failure_tracking():
 
     # Patch process_single_download to return True for first, False for second
     side_effects = [True, False]
-    with patch("bot.process_single_download", AsyncMock(side_effect=side_effects)):
+    with patch("bot.process_single_download", AsyncMock(side_effect=side_effects)), \
+         patch("bot.prepare_download", AsyncMock(return_value=MagicMock(temp_dir="test-temp"))), \
+         patch("bot.safe_cleanup"):
         await process_playlist_downloads(
             client=mock_client,
             status_msg=mock_status_msg,

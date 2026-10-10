@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 # Semaphore to govern concurrent downloads and protect 2 GB RAM server
 download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
+upload_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
 
 # Initialize Pyrogram Bot Client
 # API_ID and API_HASH default to fallback placeholders so unit tests can import safely
@@ -61,6 +62,7 @@ class ThrottledProgressUpdater:
         self.last_update_time = 0.0
         self.start_upload_time = 0.0
         self.last_upload_bytes = 0
+        self.active = True
         try:
             self.loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -89,7 +91,7 @@ class ThrottledProgressUpdater:
             self.last_upload_bytes = current
 
         dt = now - self.last_upload_time
-        if dt >= self.interval or current == total:
+        if dt >= self.interval:
             delta_bytes = current - self.last_upload_bytes
             speed = delta_bytes / dt if dt > 0 else 0
             eta = int((total - current) / speed) if speed > 0 and total > current else 0
@@ -99,6 +101,8 @@ class ThrottledProgressUpdater:
             await self._safe_edit(text)
 
     async def _safe_edit(self, text: str):
+        if not self.active:
+            return
         try:
             await self.message.edit_text(text)
         except FloodWait as e:
@@ -600,6 +604,24 @@ async def callback_vid_start_download(client: Client, callback: CallbackQuery):
 # DOWNLOAD & UPLOAD PIPELINE
 # =====================================================================
 
+async def prepare_download(status_msg, url, quality_key, max_quality_height=None):
+    """Release the download slot before upload, and drain workers on cancel."""
+    updater = ThrottledProgressUpdater(status_msg, stage="Downloading 📥")
+    try:
+        async with download_semaphore:
+            await status_msg.edit_text("⚡ <b>Starting high-speed download...</b>")
+            worker = asyncio.create_task(asyncio.to_thread(
+                download_media, url, quality_key, updater.sync_hook, max_quality_height))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                result = await worker
+                safe_cleanup(result.temp_dir)
+                raise
+    finally:
+        updater.active = False
+
+
 async def process_single_download(
     client: Client,
     status_msg: Message,
@@ -607,36 +629,30 @@ async def process_single_download(
     url: str,
     quality_key: str,
     max_quality_height: Optional[int] = None,
+    prepared_result: Optional[DownloadResult] = None,
 ) -> bool:
     """Execute download, MP4 container verification, thumbnail processing, and upload. Returns True on success, False on error."""
-    async with download_semaphore:
+    # Uploads have their own slot, so a completed file doesn't block the next
+    # download even on a server configured with one download worker.
+    async with upload_semaphore:
         updater = ThrottledProgressUpdater(status_msg, stage="Downloading 📥")
-        temp_dir = None
+        temp_dir = prepared_result.temp_dir if prepared_result else None
         try:
-            await status_msg.edit_text("⚡ <b>Starting high-speed download...</b>")
-            loop = asyncio.get_running_loop()
-
-            # Execute yt-dlp download in background thread pool
-            result: DownloadResult = await loop.run_in_executor(
-                None,
-                download_media,
-                url,
-                quality_key,
-                updater.sync_hook,
-                max_quality_height,
-            )
+            result = prepared_result
+            if result is None:
+                result = await prepare_download(status_msg, url, quality_key, max_quality_height)
             temp_dir = result.temp_dir
 
             # Verify integrity
             await status_msg.edit_text("🔍 <i>Verifying media stream integrity...</i>")
-            is_valid = verify_media_integrity(result.file_path, is_audio=result.is_audio)
+            is_valid = await asyncio.to_thread(verify_media_integrity, result.file_path, is_audio=result.is_audio)
             if not is_valid:
                 raise ValueError("Downloaded file integrity check failed or file is corrupted.")
 
             # Prepare thumbnail
             thumb_jpg = None
             if result.thumbnail_path:
-                thumb_jpg = prepare_thumbnail(result.thumbnail_path, temp_dir)
+                thumb_jpg = await asyncio.to_thread(prepare_thumbnail, result.thumbnail_path, temp_dir)
 
             # Upload to Telegram
             updater.stage = "Uploading 📤"
@@ -701,12 +717,12 @@ async def process_playlist_downloads(
     entries: List[dict],
     quality_key: str,
 ):
-    """Sequentially download and upload selected playlist videos."""
+    """Upload a finished file while downloading exactly one next playlist item."""
     total = len(entries)
     successful = 0
     failed = 0
 
-    for idx, entry in enumerate(entries, start=1):
+    async def prepare_item(idx, entry):
         video_title = entry.get("title", f"Video {idx}")
         video_url = entry.get("url") or ""
         video_id = entry.get("id") or ""
@@ -716,33 +732,52 @@ async def process_playlist_downloads(
             elif video_url:
                 video_url = f"https://www.youtube.com/watch?v={video_url}"
 
-        await status_msg.edit_text(
-            f"🔄 <b>Processing [{idx}/{total}]:</b>\n"
-            f"<i>{video_title}</i>\n\n"
-            f"Progress: {successful} succeeded, {failed} failed"
-        )
-
+        item_status = None
         try:
             # Create a separate status tracker for individual video progress
             item_status = await client.send_message(
                 chat_id=chat_id,
                 text=f"📥 <i>[{idx}/{total}] Downloading:</i> <b>{video_title}</b>",
             )
-            success = await process_single_download(
-                client=client,
-                status_msg=item_status,
-                chat_id=chat_id,
-                url=video_url,
-                quality_key=quality_key,
-                max_quality_height=None,
-            )
-            if success:
-                successful += 1
-            else:
-                failed += 1
+            result = await prepare_download(item_status, video_url, quality_key)
+            return item_status, video_url, result
         except Exception as e:
             logger.error("Failed playlist item %d (%s): %s", idx, video_url, e)
-            failed += 1
+            if item_status:
+                try:
+                    await item_status.edit_text(f"❌ <b>Download Failed:</b>\n<code>{str(e)[:300]}</code>")
+                except Exception:
+                    pass
+            return None
+
+    pending = asyncio.create_task(prepare_item(1, entries[0])) if entries else None
+    try:
+        for offset in range(total):
+            prepared = await asyncio.shield(pending)
+            pending = None
+            # Bound disk usage to the uploading file plus one prefetched file.
+            if offset + 1 < total:
+                pending = asyncio.create_task(prepare_item(offset + 2, entries[offset + 1]))
+            if prepared is None:
+                failed += 1
+                continue
+            item_status, video_url, result = prepared
+            try:
+                success = await process_single_download(
+                    client, item_status, chat_id, video_url, quality_key,
+                    prepared_result=result,
+                )
+            finally:
+                safe_cleanup(result.temp_dir)
+            successful += int(success)
+            failed += int(not success)
+    finally:
+        # Executor downloads cannot be stopped safely by cancelling their
+        # awaiter. Drain the sole prefetched item before removing its files.
+        if pending is not None:
+            prepared = await pending
+            if prepared:
+                safe_cleanup(prepared[2].temp_dir)
 
     summary_text = (
         f"🎉 <b>Playlist Download Completed!</b>\n\n"

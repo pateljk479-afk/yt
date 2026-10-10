@@ -64,7 +64,7 @@ HOST = os.getenv("HOST", "0.0.0.0")
 ENABLE_WEB_SERVER = os.getenv("ENABLE_WEB_SERVER", "true").lower() in ("true", "1", "yes")
 
 # Progress update throttle interval (seconds) to prevent Telegram FloodWait
-PROGRESS_UPDATE_INTERVAL = float(os.getenv("PROGRESS_UPDATE_INTERVAL", "3.0"))
+PROGRESS_UPDATE_INTERVAL = max(5.0, float(os.getenv("PROGRESS_UPDATE_INTERVAL", "5.0")))
 
 # Session TTL in seconds (1 hour default)
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
