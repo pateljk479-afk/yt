@@ -14,7 +14,8 @@ from pyrogram.errors import FloodWait, MessageNotModified
 
 # Optimize Pyrogram MTProto upload timeouts for cloud servers:
 # Prevent "SaveBigFilePart: Request timed out" during large file uploads (>10MB).
-Session.WAIT_TIMEOUT = max(60.0, getattr(config, "PYROGRAM_WAIT_TIMEOUT", 60.0))
+# Must be integer because MTProto ping_delay_disconnect serializes as Int.
+Session.WAIT_TIMEOUT = int(max(60, getattr(config, "PYROGRAM_WAIT_TIMEOUT", 60)))
 from downloader import (
     extract_info,
     analyze_video_qualities,
