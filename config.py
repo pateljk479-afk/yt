@@ -21,11 +21,18 @@ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(2000 * 1024 * 1024)))  # 2000
 # Download & Temporary Storage
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.abspath("./downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+# Budget for a 2 GB host, reserving space for app/dependencies.
+DOWNLOAD_STORAGE_LIMIT_BYTES = int(os.getenv("DOWNLOAD_STORAGE_LIMIT_MB", "1536")) * 1024 * 1024
+MIN_FREE_DISK_BYTES = int(os.getenv("MIN_FREE_DISK_MB", "128")) * 1024 * 1024
+# Uploading file + next file's streams + merge output must fit together.
+MAX_FILE_SIZE = min(MAX_FILE_SIZE, DOWNLOAD_STORAGE_LIMIT_BYTES // 3)
 
 # Performance & Hardware Optimization
 # Configured for high bandwidth (600 Mbps) & multi-core CPU (4 cores, 1.5 GHz, 2 GB RAM)
 CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "16"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+MAX_CONCURRENT_DOWNLOADS = min(MAX_CONCURRENT_DOWNLOADS, max(
+    1, DOWNLOAD_STORAGE_LIMIT_BYTES // max(1, 3 * MAX_FILE_SIZE)))
 MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "8"))
 BUFFER_SIZE = int(os.getenv("BUFFER_SIZE", str(1024 * 1024)))  # 1 MB I/O buffer
 HTTP_CHUNK_SIZE = int(os.getenv("HTTP_CHUNK_SIZE", str(10 * 1024 * 1024)))  # 10 MB HTTP chunks

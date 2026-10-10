@@ -159,7 +159,7 @@ def safe_cleanup(path: Optional[str]):
         return
     try:
         if os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
+            shutil.rmtree(path)
         else:
             os.remove(path)
     except Exception as e:

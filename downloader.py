@@ -13,6 +13,7 @@ import yt_dlp
 import config
 from proxy_check import run_with_proxy_recovery, ProxyRecoveryError
 from media_routing import install_media_routing
+from storage import ensure_download_space, cleanup_download_folder, directory_size
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +438,8 @@ def build_ydl_options(
         "buffersize": config.BUFFER_SIZE,
         "http_chunk_size": config.HTTP_CHUNK_SIZE,
         "concurrent_fragment_downloads": config.CONCURRENT_FRAGMENT_DOWNLOADS,
+        "postprocessor_hooks": [lambda event: ensure_download_space(
+            extra=directory_size(target_dir)) if event.get("status") == "started" else None],
         "writethumbnail": True,
         "nocheckcertificate": True,
         "ignoreerrors": False,
@@ -490,17 +493,39 @@ def build_ydl_options(
     return opts
 
 
-def download_media(
+def download_media(url, quality_key, progress_hook=None, max_quality_height=None):
+    """Own the temporary directory even when extraction/merging fails."""
+    ensure_download_space()
+    temp_dir = tempfile.mkdtemp(prefix="yt_dl_", dir=config.DOWNLOAD_DIR)
+    last_check = 0.0
+
+    def guarded_progress(data):
+        nonlocal last_check
+        now = time.monotonic()
+        if now - last_check >= 1:
+            ensure_download_space()
+            last_check = now
+        if progress_hook:
+            progress_hook(data)
+
+    try:
+        return _download_media_impl(url, quality_key, guarded_progress, max_quality_height, temp_dir)
+    except BaseException:
+        cleanup_download_folder(temp_dir)
+        raise
+
+
+def _download_media_impl(
     url: str,
     quality_key: str,
     progress_hook: Optional[Callable] = None,
     max_quality_height: Optional[int] = None,
+    temp_dir: Optional[str] = None,
 ) -> DownloadResult:
     """
     Download video or audio using optimal multithreaded yt-dlp settings.
     Ensures MP4 format, 2 GB limit degradation, valid thumbnail extraction, and returns DownloadResult.
     """
-    temp_dir = tempfile.mkdtemp(prefix="yt_dl_", dir=config.DOWNLOAD_DIR)
     is_audio = (quality_key == "audio")
     
     # 1. Determine format selector with strict <= 2GB degradation
@@ -548,6 +573,8 @@ def download_media(
         if isinstance(err, ProxyRecoveryError):
             raise
         err_msg = str(err)
+        if "Not enough server storage" in err_msg:
+            raise
         logger.warning("Primary download attempt failed for %s: %s", url, err_msg)
         # A format-selection error can be retried without cookies. Authentication
         # errors must keep the cookies: retrying from a cloud IP anonymously only
@@ -653,8 +680,7 @@ def download_media(
                 progress_hook=progress_hook,
                 is_audio=is_audio,
             )
-            with yt_dlp.YoutubeDL(ydl_opts_fb) as ydl_fb:
-                info = ydl_fb.extract_info(url, download=True)
+            info = _extract_with_recovery(url, ydl_opts_fb, True)
             for fname in os.listdir(temp_dir):
                 fpath = os.path.join(temp_dir, fname)
                 ext = os.path.splitext(fname)[1].lower()
@@ -666,6 +692,8 @@ def download_media(
             logger.error("Degradation fallback download failed: %s", e)
 
     # Preserve original YouTube title in file name on disk
+    if file_size > config.MAX_FILE_SIZE:
+        raise ValueError("Downloaded file exceeds the server's storage-safe file size. Choose a lower quality.")
     clean_base = sanitize_filename(title)
     final_ext = ".mp3" if is_audio else ".mp4"
     desired_filename = f"{clean_base}{final_ext}"

@@ -175,6 +175,16 @@ python main.py
 
 ### Minimizing paid YouTube proxy traffic
 
+Temporary storage is bounded by `DOWNLOAD_STORAGE_LIMIT_MB` (default 1536 MB
+for a 2 GB server), with `MIN_FREE_DISK_MB=128` physical free space reserved.
+The effective file limit is storage budget / 3 (512 MB by default), allowing
+space for one uploaded file, the next downloaded streams, and merging.
+Lower qualities may therefore be offered on small servers. Failed download
+folders are removed immediately; startup removes only abandoned `yt_dl_*`
+folders inside `DOWNLOAD_DIR`, not cookies, sessions or other server files.
+These guards abort transfers when space is low; they cannot enforce the
+hosting provider's total quota or account for unrelated files elsewhere.
+
 With `YOUTUBE_PROXY` configured, YouTube metadata uses the proxy, but video,
 audio and thumbnails ALWAYS use direct server connections. Native
 yt-dlp downloading is used instead of aria2 so request routing is enforced.

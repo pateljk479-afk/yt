@@ -70,7 +70,8 @@ def test_estimate_audio_size():
     assert size_calc == int((128 * 1000 / 8) * 60)
 
 
-def test_analyze_video_qualities_2gb_limit_degradation():
+def test_analyze_video_qualities_2gb_limit_degradation(monkeypatch):
+    monkeypatch.setattr(config, "MAX_FILE_SIZE", 2000 * 1024 * 1024)
     """
     Simulates the exact user requirement:
     4K is available but file size is 2.3 GB (> 2 GB).
@@ -244,7 +245,9 @@ def test_validate_youtube_cookie_file_rejects_logged_out_export(tmp_path):
     assert "LOGIN_INFO" in validation.reason
 
 
-def test_download_media_quality_degradation_logic():
+def test_download_media_quality_degradation_logic(monkeypatch):
+    monkeypatch.setattr(config, "MAX_FILE_SIZE", 2000 * 1024 * 1024)
+    monkeypatch.setattr("downloader.ensure_download_space", lambda **kwargs: None)
     """Verify format selection logic degrades when requested height exceeds 2 GB."""
     from unittest.mock import patch, MagicMock
     from downloader import download_media

@@ -7,9 +7,9 @@ from pyrogram import idle
 import config
 from bot import app
 from web import start_web_server
-from uploader import safe_cleanup
 from proxy_check import check_proxy
 from downloader import get_js_runtimes
+from storage import cleanup_stale_downloads
 
 # Configure structured logging
 logging.basicConfig(
@@ -56,6 +56,8 @@ async def main():
 
     # Ensure downloads directory exists
     os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
+    removed = await asyncio.to_thread(cleanup_stale_downloads)
+    logger.info("Startup cleanup removed %d abandoned download folders", removed)
 
     # 2. Start lightweight HTTP health check server for Render hosting
     web_runner = None
@@ -107,7 +109,8 @@ async def main():
         await app.stop()
         if web_runner:
             await web_runner.cleanup()
-        safe_cleanup(config.DOWNLOAD_DIR)
+        # Worker threads may still be writing during shutdown. Clean only
+        # bot-owned abandoned directories on next startup, never the whole root.
         logger.info("Shutdown completed cleanly.")
 
 
