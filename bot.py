@@ -6,11 +6,15 @@ import json
 import tempfile
 from typing import Optional, List
 
+import config
 from pyrogram import Client, filters
+from pyrogram.session import Session
 from pyrogram.types import Message, CallbackQuery
 from pyrogram.errors import FloodWait, MessageNotModified
 
-import config
+# Optimize Pyrogram MTProto upload timeouts for cloud servers:
+# Prevent "SaveBigFilePart: Request timed out" during large file uploads (>10MB).
+Session.WAIT_TIMEOUT = max(60.0, getattr(config, "PYROGRAM_WAIT_TIMEOUT", 60.0))
 from downloader import (
     extract_info,
     analyze_video_qualities,
@@ -47,7 +51,7 @@ app = Client(
     api_id=config.API_ID if config.API_ID else 12345,
     api_hash=config.API_HASH if config.API_HASH else "placeholder_hash",
     bot_token=config.BOT_TOKEN if config.BOT_TOKEN else "placeholder_token",
-    workers=16,
+    workers=min(8, (os.cpu_count() or 2) * 2),
     max_concurrent_transmissions=config.MAX_CONCURRENT_TRANSMISSIONS,
 )
 
@@ -63,6 +67,7 @@ class ThrottledProgressUpdater:
         self.start_upload_time = 0.0
         self.last_upload_bytes = 0
         self.active = True
+        self._is_editing = False
         try:
             self.loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -72,7 +77,7 @@ class ThrottledProgressUpdater:
         """yt-dlp progress hook running in worker thread."""
         if d.get("status") == "downloading":
             now = time.time()
-            if now - self.last_update_time >= self.interval:
+            if now - self.last_update_time >= self.interval and not self._is_editing:
                 self.last_update_time = now
                 current = d.get("downloaded_bytes", 0)
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
@@ -84,6 +89,8 @@ class ThrottledProgressUpdater:
 
     async def async_upload_hook(self, current: int, total: int):
         """Pyrogram upload progress callback with real speed & ETA calculation."""
+        if not self.active:
+            return
         now = time.time()
         if self.start_upload_time == 0.0:
             self.start_upload_time = now
@@ -106,7 +113,8 @@ class ThrottledProgressUpdater:
         try:
             await self.message.edit_text(text)
         except FloodWait as e:
-            await asyncio.sleep(e.value)
+            # Push forward throttle window instead of sleeping in transmission loop
+            self.last_update_time = time.time() + e.value
         except MessageNotModified:
             pass
         except Exception as e:
@@ -667,31 +675,55 @@ async def process_single_download(
             # Format file name preserving original YouTube title
             clean_filename = sanitize_filename(result.title) + (".mp3" if result.is_audio else ".mp4")
 
-            if result.is_audio:
-                await client.send_audio(
-                    chat_id=chat_id,
-                    audio=result.file_path,
-                    caption=caption,
-                    title=result.title,
-                    duration=result.duration,
-                    thumb=thumb_jpg,
-                    file_name=clean_filename,
-                    progress=updater.async_upload_hook,
-                )
-            else:
-                await client.send_video(
-                    chat_id=chat_id,
-                    video=result.file_path,
-                    caption=caption,
-                    duration=result.duration,
-                    width=result.width,
-                    height=result.height,
-                    thumb=thumb_jpg,
-                    file_name=clean_filename,
-                    supports_streaming=True,
-                    progress=updater.async_upload_hook,
-                )
+            max_upload_retries = 3
+            upload_success = False
+            last_upload_err = None
 
+            for upload_attempt in range(1, max_upload_retries + 1):
+                try:
+                    if upload_attempt > 1:
+                        logger.warning("Retrying upload for '%s' (attempt %d/%d)...", result.title, upload_attempt, max_upload_retries)
+                        updater.start_upload_time = 0.0
+                        await status_msg.edit_text(f"📤 <i>Retrying Telegram upload (attempt {upload_attempt}/{max_upload_retries})...</i>")
+
+                    if result.is_audio:
+                        await client.send_audio(
+                            chat_id=chat_id,
+                            audio=result.file_path,
+                            caption=caption,
+                            title=result.title,
+                            duration=result.duration,
+                            thumb=thumb_jpg,
+                            file_name=clean_filename,
+                            progress=updater.async_upload_hook,
+                        )
+                    else:
+                        await client.send_video(
+                            chat_id=chat_id,
+                            video=result.file_path,
+                            caption=caption,
+                            duration=result.duration,
+                            width=result.width,
+                            height=result.height,
+                            thumb=thumb_jpg,
+                            file_name=clean_filename,
+                            supports_streaming=True,
+                            progress=updater.async_upload_hook,
+                        )
+                    upload_success = True
+                    break
+                except (TimeoutError, OSError, ConnectionError) as err:
+                    last_upload_err = err
+                    logger.warning("Upload attempt %d failed for '%s': %s", upload_attempt, result.title, err)
+                    if upload_attempt < max_upload_retries:
+                        await asyncio.sleep(2 * upload_attempt)
+                    else:
+                        raise
+
+            if not upload_success and last_upload_err:
+                raise last_upload_err
+
+            updater.active = False
             try:
                 await status_msg.delete()
             except Exception:

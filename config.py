@@ -29,11 +29,12 @@ MAX_FILE_SIZE = min(MAX_FILE_SIZE, DOWNLOAD_STORAGE_LIMIT_BYTES // 3)
 
 # Performance & Hardware Optimization
 # Configured for high bandwidth (600 Mbps) & multi-core CPU (4 cores, 1.5 GHz, 2 GB RAM)
-CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "16"))
+CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "4"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
 MAX_CONCURRENT_DOWNLOADS = min(MAX_CONCURRENT_DOWNLOADS, max(
     1, DOWNLOAD_STORAGE_LIMIT_BYTES // max(1, 3 * MAX_FILE_SIZE)))
-MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "8"))
+MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "3"))
+PYROGRAM_WAIT_TIMEOUT = float(os.getenv("PYROGRAM_WAIT_TIMEOUT", "60.0"))
 BUFFER_SIZE = int(os.getenv("BUFFER_SIZE", str(1024 * 1024)))  # 1 MB I/O buffer
 HTTP_CHUNK_SIZE = int(os.getenv("HTTP_CHUNK_SIZE", str(10 * 1024 * 1024)))  # 10 MB HTTP chunks
 COOKIES_FILE = os.getenv("COOKIES_FILE", os.path.abspath("cookies.txt") if os.path.exists("cookies.txt") else "")
