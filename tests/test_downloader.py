@@ -129,7 +129,11 @@ def test_analyze_video_qualities_under_limit():
 
 
 def test_build_ydl_options():
-    opts = build_ydl_options("/tmp/test", "bv*[height<=1080]+ba/b", is_audio=False)
+    from unittest.mock import patch
+
+    with patch("downloader.get_cookiefile_path", return_value=None):
+        opts = build_ydl_options("/tmp/test", "bv*[height<=1080]+ba/b", is_audio=False)
+
     assert opts["format"] == "bv*[height<=1080]+ba/b"
     assert opts["merge_output_format"] == "mp4"
     assert opts["concurrent_fragment_downloads"] == config.CONCURRENT_FRAGMENT_DOWNLOADS
@@ -138,6 +142,16 @@ def test_build_ydl_options():
     # Let yt-dlp choose its current non-token-gated player clients. Pinning a
     # static list becomes stale as YouTube changes its client requirements.
     assert "extractor_args" not in opts
+
+
+def test_build_ydl_options_uses_cookie_safe_player_clients():
+    from unittest.mock import patch
+
+    with patch("downloader.get_cookiefile_path", return_value="/tmp/cookies.txt"):
+        opts = build_ydl_options("/tmp/test", "bv*[height<=1080]+ba/b", is_audio=False)
+
+    assert opts["cookiefile"] == "/tmp/cookies.txt"
+    assert opts["extractor_args"]["youtube"]["player_client"] == ["default", "web_embedded"]
 
 
 def test_validate_youtube_cookie_file_requires_a_signed_in_session(tmp_path):

@@ -311,6 +311,13 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
         }
         if use_cookies and cookies_path:
             opts["cookiefile"] = cookies_path
+            # yt-dlp's authenticated default currently includes
+            # tv_downgraded, which YouTube can answer with "The page needs to
+            # be reloaded." Keep the supported web-embedded fallback enabled
+            # for signed-in requests instead.
+            opts["extractor_args"] = {
+                "youtube": {"player_client": ["default", "web_embedded"]}
+            }
         if is_playlist:
             opts["extract_flat"] = "in_playlist"
         return opts
@@ -321,14 +328,6 @@ def extract_info(url: str, is_playlist: bool = False) -> dict:
             return ydl.extract_info(clean_url, download=False)
     except Exception as e1:
         logger.warning("Primary metadata extraction failed for %s: %s", clean_url, e1)
-        # Tier 2: If cookies caused issue, retry without cookies
-        if cookies_path:
-            try:
-                logger.info("Retrying extraction without cookies for %s...", clean_url)
-                with yt_dlp.YoutubeDL(_get_opts(use_cookies=False)) as ydl:
-                    return ydl.extract_info(clean_url, download=False)
-            except Exception as e2:
-                logger.warning("Fallback extraction without cookies failed: %s", e2)
         raise e1
 
 
@@ -361,6 +360,11 @@ def build_ydl_options(
     cookies_path = get_cookiefile_path()
     if use_cookies and cookies_path:
         opts["cookiefile"] = cookies_path
+        # See the matching metadata options above. This only applies when a
+        # validated signed-in cookie export is actually being used.
+        opts["extractor_args"] = {
+            "youtube": {"player_client": ["default", "web_embedded"]}
+        }
     
     if is_audio:
         opts["format"] = "ba/b"
