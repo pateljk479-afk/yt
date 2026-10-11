@@ -186,18 +186,6 @@ async def _fast_save_file(
         if path is None:
             return None
 
-        queue = _sf_mod.asyncio.Queue(16)
-
-        async def worker(session):
-            while True:
-                data = await queue.get()
-                if data is None:
-                    return
-                try:
-                    await session.invoke(data)
-                except Exception as e:
-                    _sf_mod.log.exception(e)
-
         part_size = 512 * 1024
 
         if isinstance(path, (str, _sf_mod.PurePath)):
@@ -213,36 +201,94 @@ async def _fast_save_file(
         fp.seek(0)
 
         if file_size == 0:
+            if isinstance(path, (str, _sf_mod.PurePath)):
+                fp.close()
             raise ValueError("File size equals to 0 B")
 
         file_size_limit_mib = 4000 if getattr(self, "me", None) and getattr(self.me, "is_premium", False) else 2000
         if file_size > file_size_limit_mib * 1024 * 1024:
+            if isinstance(path, (str, _sf_mod.PurePath)):
+                fp.close()
             raise ValueError(f"Can't upload files bigger than {file_size_limit_mib} MiB")
 
         file_total_parts = int(_sf_mod.math.ceil(file_size / part_size))
         is_big = file_size > 10 * 1024 * 1024
-        # Use 8 pipelined workers to fill the Bandwidth-Delay Product (BDP) pipe across high-latency DC links
-        workers_count = 8 if is_big else 1
         is_missing_part = file_id is not None
         file_id = file_id or self.rnd_id()
         md5_sum = _sf_mod.md5() if not is_big and not is_missing_part else None
-        session = _sf_mod.Session(
-            self, await self.storage.dc_id(), await self.storage.auth_key(),
-            await self.storage.test_mode(), is_media=True
-        )
-        workers = [self.loop.create_task(worker(session)) for _ in range(workers_count)]
+
+        # Multi-session parallel MTProto upload:
+        # Avoid single TCP socket serialization bottleneck (which caps MTProto uploads to ~150 KB/s).
+        # Open separate independent MTProto media sessions to parallelize chunk transmission across separate sockets.
+        sessions_count = getattr(config, "UPLOAD_WORKERS", 4) if (is_big and not is_missing_part) else 1
+
+        dc_id = await self.storage.dc_id()
+        auth_key = await self.storage.auth_key()
+        test_mode = await self.storage.test_mode()
+
+        sessions = [
+            _sf_mod.Session(self, dc_id, auth_key, test_mode, is_media=True)
+            for _ in range(sessions_count)
+        ]
+        await _sf_mod.asyncio.gather(*(s.start() for s in sessions))
+
+        queue = _sf_mod.asyncio.Queue(sessions_count * 2)
+        uploaded_bytes = 0
+        worker_exception = [None]
+
+        async def worker(session: _sf_mod.Session):
+            nonlocal uploaded_bytes
+            while True:
+                item = await queue.get()
+                if item is None:
+                    queue.task_done()
+                    return
+                rpc, chunk_len = item
+                for attempt in range(5):
+                    if worker_exception[0] is not None:
+                        queue.task_done()
+                        return
+                    try:
+                        await session.invoke(rpc)
+                        break
+                    except _sf_mod.FloodWait as e:
+                        logger.warning("Upload FloodWait: sleeping %s seconds", e.value)
+                        await _sf_mod.asyncio.sleep(e.value)
+                    except Exception as e:
+                        if attempt == 4:
+                            logger.error("Chunk upload failed after 5 retries: %s", e)
+                            worker_exception[0] = e
+                            queue.task_done()
+                            return
+                        await _sf_mod.asyncio.sleep(0.5 * (attempt + 1))
+
+                queue.task_done()
+                uploaded_bytes += chunk_len
+
+                if progress and worker_exception[0] is None:
+                    try:
+                        func = _sf_mod.functools.partial(
+                            progress,
+                            min(uploaded_bytes, file_size),
+                            file_size,
+                            *progress_args
+                        )
+                        if _sf_mod.inspect.iscoroutinefunction(progress):
+                            await func()
+                        else:
+                            await self.loop.run_in_executor(self.executor, func)
+                    except _sf_mod.StopTransmission:
+                        worker_exception[0] = _sf_mod.StopTransmission()
+                        return
+                    except Exception:
+                        pass
+
+        workers = [self.loop.create_task(worker(s)) for s in sessions]
 
         try:
-            await session.start()
-            fp.seek(part_size * file_part)
-
-            while True:
+            if is_missing_part:
+                fp.seek(part_size * file_part)
                 chunk = fp.read(part_size)
-                if not chunk:
-                    if not is_big and not is_missing_part:
-                        md5_sum = "".join([hex(i)[2:].zfill(2) for i in md5_sum.digest()])
-                    break
-
                 if is_big:
                     rpc = _sf_mod.raw.functions.upload.SaveBigFilePart(
                         file_id=file_id,
@@ -256,32 +302,54 @@ async def _fast_save_file(
                         file_part=file_part,
                         bytes=chunk
                     )
+                await sessions[0].invoke(rpc)
+                return
 
-                await queue.put(rpc)
+            fp.seek(part_size * file_part)
+            current_part = file_part
 
-                if is_missing_part:
-                    return
+            while True:
+                if worker_exception[0] is not None:
+                    break
+                chunk = fp.read(part_size)
+                if not chunk:
+                    if not is_big and not is_missing_part:
+                        md5_sum = "".join([hex(i)[2:].zfill(2) for i in md5_sum.digest()])
+                    break
+
+                if is_big:
+                    rpc = _sf_mod.raw.functions.upload.SaveBigFilePart(
+                        file_id=file_id,
+                        file_part=current_part,
+                        file_total_parts=file_total_parts,
+                        bytes=chunk
+                    )
+                else:
+                    rpc = _sf_mod.raw.functions.upload.SaveFilePart(
+                        file_id=file_id,
+                        file_part=current_part,
+                        bytes=chunk
+                    )
 
                 if not is_big and not is_missing_part:
                     md5_sum.update(chunk)
 
-                file_part += 1
+                await queue.put((rpc, len(chunk)))
+                current_part += 1
 
-                if progress:
-                    func = _sf_mod.functools.partial(
-                        progress,
-                        min(file_part * part_size, file_size),
-                        file_size,
-                        *progress_args
-                    )
-                    if _sf_mod.inspect.iscoroutinefunction(progress):
-                        await func()
-                    else:
-                        await self.loop.run_in_executor(self.executor, func)
+            for _ in sessions:
+                await queue.put(None)
+
+            await _sf_mod.asyncio.gather(*workers)
+
+            if worker_exception[0] is not None:
+                raise worker_exception[0]
+
         except _sf_mod.StopTransmission:
             raise
         except Exception as e:
             _sf_mod.log.exception(e)
+            raise
         else:
             if is_big:
                 return _sf_mod.raw.types.InputFileBig(
@@ -297,10 +365,7 @@ async def _fast_save_file(
                     md5_checksum=md5_sum
                 )
         finally:
-            for _ in workers:
-                await queue.put(None)
-            await _sf_mod.asyncio.gather(*workers)
-            await session.stop()
+            await _sf_mod.asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
             if isinstance(path, (str, _sf_mod.PurePath)):
                 fp.close()
 
@@ -488,7 +553,11 @@ async def speedtest_command(client: Client, message: Message):
     status = await message.reply_text("🌐 <b>Running server network speed test...</b>\n\n📡 <i>Measuring latency...</i>")
     try:
         import aiohttp
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://speed.cloudflare.com/",
+            "Origin": "https://speed.cloudflare.com",
+        }
         async with aiohttp.ClientSession(headers=headers) as session:
             # 1. Latency test
             pings = []
@@ -499,21 +568,21 @@ async def speedtest_command(client: Client, message: Message):
                 pings.append((time.time() - t0) * 1000)
             avg_ping = sum(pings) / len(pings)
 
-            # 2. Download test (15 MB)
+            # 2. Download test (10 MB via Cloudflare)
             await status.edit_text(
                 f"🌐 <b>Running server network speed test...</b>\n\n"
                 f"📡 Latency: <code>{avg_ping:.0f} ms</code>\n"
-                f"📥 <i>Testing download speed (15 MB)...</i>"
+                f"📥 <i>Testing download speed (10 MB)...</i>"
             )
             t0 = time.time()
-            async with session.get("https://speed.cloudflare.com/__down?bytes=15000000", timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            async with session.get("https://speed.cloudflare.com/__down?bytes=10000000", timeout=aiohttp.ClientTimeout(total=20)) as resp:
                 data = await resp.read()
             down_sec = max(0.001, time.time() - t0)
             down_bytes = len(data)
             down_mbs = (down_bytes / (1024 * 1024)) / down_sec
             down_mbps = (down_bytes * 8) / (down_sec * 1_000_000)
 
-            # 3. Upload test (10 MB)
+            # 3. Upload test (10 MB via Cloudflare)
             await status.edit_text(
                 f"🌐 <b>Running server network speed test...</b>\n\n"
                 f"📡 Latency: <code>{avg_ping:.0f} ms</code>\n"
@@ -528,14 +597,48 @@ async def speedtest_command(client: Client, message: Message):
             up_mbs = (len(up_payload) / (1024 * 1024)) / up_sec
             up_mbps = (len(up_payload) * 8) / (up_sec * 1_000_000)
 
+            # 4. Direct Telegram MTProto Upload test (2 MB probe directly to Telegram DC)
+            await status.edit_text(
+                f"🌐 <b>Running server network speed test...</b>\n\n"
+                f"📡 Latency: <code>{avg_ping:.0f} ms</code>\n"
+                f"📥 Download: <code>{down_mbs:.2f} MB/s • {down_mbps:.1f} Mbps</code>\n"
+                f"📤 Upload: <code>{up_mbs:.2f} MB/s • {up_mbps:.1f} Mbps</code>\n"
+                f"⚡ <i>Testing real Telegram MTProto upload speed (2 MB)...</i>"
+            )
+            tg_mbs, tg_mbps = 0.0, 0.0
+            try:
+                tg_t0 = time.time()
+                dc_id = await client.storage.dc_id()
+                auth_key = await client.storage.auth_key()
+                test_mode = await client.storage.test_mode()
+                tg_session = _sf_mod.Session(client, dc_id, auth_key, test_mode, is_media=True)
+                await tg_session.start()
+                tg_dummy_data = b"0" * (512 * 1024)
+                tg_fid = client.rnd_id()
+                for p in range(4):
+                    await tg_session.invoke(_sf_mod.raw.functions.upload.SaveBigFilePart(
+                        file_id=tg_fid, file_part=p, file_total_parts=4, bytes=tg_dummy_data
+                    ))
+                await tg_session.stop()
+                tg_sec = max(0.001, time.time() - tg_t0)
+                tg_bytes = 4 * 512 * 1024
+                tg_mbs = (tg_bytes / (1024 * 1024)) / tg_sec
+                tg_mbps = (tg_bytes * 8) / (tg_sec * 1_000_000)
+            except Exception as tg_err:
+                logger.warning("Telegram MTProto speed probe skipped/failed: %s", tg_err)
+
             result_text = (
                 f"🌐 <b>SERVER SPEED TEST RESULTS</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📥 <b>Download:</b> <code>{down_mbs:.2f} MB/s • {down_mbps:.1f} Mbps</code>\n"
-                f"📤 <b>Upload:</b> <code>{up_mbs:.2f} MB/s • {up_mbps:.1f} Mbps</code>\n"
-                f"📡 <b>Latency:</b> <code>{avg_ping:.0f} ms</code>\n"
+                f"📥 <b>Internet Download:</b> <code>{down_mbs:.2f} MB/s • {down_mbps:.1f} Mbps</code>\n"
+                f"📤 <b>Internet Upload:</b> <code>{up_mbs:.2f} MB/s • {up_mbps:.1f} Mbps</code>\n"
+            )
+            if tg_mbs > 0:
+                result_text += f"⚡ <b>Telegram DC Upload:</b> <code>{tg_mbs:.2f} MB/s • {tg_mbps:.1f} Mbps</code>\n"
+            result_text += (
+                f"📡 <b>Network Latency:</b> <code>{avg_ping:.0f} ms</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"ℹ️ <i>Measured directly on server host via Cloudflare edge.</i>"
+                f"ℹ️ <i>Measured directly on server host (Cloudflare edge & Telegram MTProto DC).</i>"
             )
             await status.edit_text(result_text)
     except Exception as e:

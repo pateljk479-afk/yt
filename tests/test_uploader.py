@@ -112,3 +112,52 @@ def test_safe_cleanup():
     assert os.path.exists(tmpdir)
     safe_cleanup(tmpdir)
     assert not os.path.exists(tmpdir)
+
+
+import pytest
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+@pytest.mark.asyncio
+async def test_fast_save_file_multi_session():
+    import bot
+    from bot import _fast_save_file
+    import pyrogram.methods.advanced.save_file as _sf_mod
+
+    with tempfile.NamedTemporaryFile("wb", delete=False) as f:
+        # Create 11 MB dummy file (exceeds 10MB -> triggers multi-session)
+        f.write(b"x" * (11 * 1024 * 1024))
+        tmp_path = f.name
+
+    created_sessions = []
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            created_sessions.append(self)
+            self.start = AsyncMock()
+            self.stop = AsyncMock()
+            self.invoke = AsyncMock(return_value=True)
+
+    client = MagicMock()
+    client.save_file_semaphore = asyncio.Semaphore(1)
+    client.storage.dc_id = AsyncMock(return_value=5)
+    client.storage.auth_key = AsyncMock(return_value=b"auth")
+    client.storage.test_mode = AsyncMock(return_value=False)
+    client.rnd_id = MagicMock(return_value=12345)
+    client.loop = asyncio.get_running_loop()
+
+    progress_calls = []
+    async def mock_progress(current, total):
+        progress_calls.append((current, total))
+
+    try:
+        with patch.object(_sf_mod, "Session", FakeSession):
+            result = await _fast_save_file(client, tmp_path, progress=mock_progress)
+            assert result is not None
+            assert len(created_sessions) == 4
+            assert all(s.start.called for s in created_sessions)
+            assert all(s.stop.called for s in created_sessions)
+            assert len(progress_calls) > 0
+    finally:
+        os.unlink(tmp_path)
+

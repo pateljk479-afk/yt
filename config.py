@@ -24,16 +24,13 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # Budget for a 2 GB host, reserving space for app/dependencies.
 DOWNLOAD_STORAGE_LIMIT_BYTES = int(os.getenv("DOWNLOAD_STORAGE_LIMIT_MB", "1536")) * 1024 * 1024
 MIN_FREE_DISK_BYTES = int(os.getenv("MIN_FREE_DISK_MB", "128")) * 1024 * 1024
-# Uploading file + next file's streams + merge output must fit together.
-MAX_FILE_SIZE = min(MAX_FILE_SIZE, DOWNLOAD_STORAGE_LIMIT_BYTES // 3)
 
 # Performance & Hardware Optimization
 # Configured for high bandwidth (600 Mbps) & multi-core CPU (4 cores, 1.5 GHz, 2 GB RAM)
 CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "4"))
-MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
-MAX_CONCURRENT_DOWNLOADS = min(MAX_CONCURRENT_DOWNLOADS, max(
-    1, DOWNLOAD_STORAGE_LIMIT_BYTES // max(1, 3 * MAX_FILE_SIZE)))
-MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "3"))
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
+MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "1"))
+UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "4"))
 PYROGRAM_WAIT_TIMEOUT = int(os.getenv("PYROGRAM_WAIT_TIMEOUT", "60"))
 PREFETCH_PLAYLIST = os.getenv("PREFETCH_PLAYLIST", "false").lower() in ("true", "1", "yes")
 BUFFER_SIZE = int(os.getenv("BUFFER_SIZE", str(1024 * 1024)))  # 1 MB I/O buffer
