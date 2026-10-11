@@ -115,3 +115,65 @@ def test_playlist_entry_url_resolution():
     assert resolved_urls[1] == "https://www.youtube.com/watch?v=only_id_456"
     assert resolved_urls[2] == "https://www.youtube.com/watch?v=relative_id_789"
     assert resolved_urls[3] == "https://www.youtube.com/watch?v=fallback_id_999"
+
+
+@pytest.mark.asyncio
+async def test_logs_command_replies_text_when_short():
+    from unittest.mock import AsyncMock, MagicMock
+    from bot import logs_command, memory_log_handler
+
+    memory_log_handler.buffer.clear()
+    memory_log_handler.buffer.append("2026-10-10 21:00:00 [INFO] test: Server initialized")
+    memory_log_handler.buffer.append("2026-10-10 21:01:00 [INFO] test: Bot active")
+
+    mock_msg = MagicMock()
+    mock_msg.chat = MagicMock(id=123)
+    mock_msg.reply_text = AsyncMock()
+
+    await logs_command(MagicMock(), mock_msg)
+    mock_msg.reply_text.assert_awaited_once()
+    assert "Server initialized" in mock_msg.reply_text.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_speedtest_command_execution():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from bot import speedtest_command
+
+    mock_msg = MagicMock()
+    mock_msg.chat = MagicMock(id=123)
+    status_msg = MagicMock()
+    status_msg.edit_text = AsyncMock()
+    mock_msg.reply_text = AsyncMock(return_value=status_msg)
+
+    # Mock aiohttp session to return synthetic speed numbers without outbound network calls
+    class MockResp:
+        def __init__(self, data=b"x" * 1024):
+            self._data = data
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def read(self):
+            return self._data
+
+    class MockSession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        def get(self, *args, **kwargs):
+            return MockResp(b"x" * (1024 * 1024))
+        def post(self, *args, **kwargs):
+            return MockResp(b"ok")
+
+    with patch("aiohttp.ClientSession", return_value=MockSession()):
+        await speedtest_command(MagicMock(), mock_msg)
+
+    assert status_msg.edit_text.call_count >= 1
+    last_text = status_msg.edit_text.call_args[0][0]
+    assert "SERVER SPEED TEST RESULTS" in last_text
+    assert "Download:" in last_text
+    assert "Upload:" in last_text
+    assert "MB/s" in last_text
+    assert "Mbps" in last_text

@@ -16,6 +16,297 @@ from pyrogram.errors import FloodWait, MessageNotModified
 # Prevent "SaveBigFilePart: Request timed out" during large file uploads (>10MB).
 # Must be integer because MTProto ping_delay_disconnect serializes as Int.
 Session.WAIT_TIMEOUT = int(max(60, getattr(config, "PYROGRAM_WAIT_TIMEOUT", 60)))
+
+# MTProto session stabilization:
+# 1. Dynamically sync client clock offset with Telegram server time to eliminate
+#    "The msg_id belongs to over 300 seconds in the past" on cloud containers with time drift.
+# 2. Reset stored_msg_ids on SecurityCheckMismatch to eliminate the infinite reconnect loop
+#    "The msg_id is lower than all the stored values".
+import pyrogram.session.session as _py_session
+from pyrogram.session.internals import MsgId as _MsgId
+
+_orig_msg_id_new = _MsgId.__new__
+
+def _patched_msg_id_new(cls, *args, **kwargs):
+    now = int(time.time() + getattr(_MsgId, "time_offset", 0))
+    cls.offset = (cls.offset + 4) if now == cls.last_time else 0
+    msg_id = (now * 2 ** 32) + cls.offset
+    cls.last_time = now
+    return msg_id
+
+_MsgId.__new__ = staticmethod(_patched_msg_id_new)
+_MsgId.time_offset = 0
+
+_orig_handle_packet = _py_session.Session.handle_packet
+
+async def _stabilized_handle_packet(self, packet):
+    try:
+        data = await self.loop.run_in_executor(
+            _py_session.pyrogram.crypto_executor,
+            _py_session.mtproto.unpack,
+            _py_session.BytesIO(packet),
+            self.session_id,
+            self.auth_key,
+            self.auth_key_id
+        )
+    except Exception as e:
+        _py_session.log.error("Failed to unpack packet: %s", e)
+        return
+
+    messages = (
+        data.body.messages
+        if isinstance(data.body, _py_session.MsgContainer)
+        else [data]
+    )
+
+    for msg in messages:
+        try:
+            server_time = int(msg.msg_id >> 32)
+            local_time = int(time.time())
+            drift = server_time - local_time
+            if abs(drift - getattr(_MsgId, "time_offset", 0)) > 5:
+                _MsgId.time_offset = drift
+        except Exception:
+            pass
+
+        if msg.seq_no % 2 != 0:
+            if msg.msg_id in self.pending_acks:
+                continue
+            else:
+                self.pending_acks.add(msg.msg_id)
+
+        try:
+            if len(self.stored_msg_ids) > _py_session.Session.STORED_MSG_IDS_MAX_SIZE:
+                del self.stored_msg_ids[:_py_session.Session.STORED_MSG_IDS_MAX_SIZE // 2]
+
+            if self.stored_msg_ids:
+                if msg.msg_id < self.stored_msg_ids[0]:
+                    raise _py_session.SecurityCheckMismatch("The msg_id is lower than all the stored values")
+
+                if msg.msg_id in self.stored_msg_ids:
+                    raise _py_session.SecurityCheckMismatch("The msg_id is equal to any of the stored values")
+
+                time_diff = (msg.msg_id - _MsgId()) / 2 ** 32
+
+                if time_diff > 30:
+                    raise _py_session.SecurityCheckMismatch(
+                        "The msg_id belongs to over 30 seconds in the future. "
+                        "Most likely the client time has to be synchronized."
+                    )
+
+                if time_diff < -300:
+                    raise _py_session.SecurityCheckMismatch(
+                        "The msg_id belongs to over 300 seconds in the past. "
+                        "Most likely the client time has to be synchronized."
+                    )
+        except _py_session.SecurityCheckMismatch as e:
+            _py_session.log.info("Discarding packet: %s (clearing stored msg IDs for clean session recovery)", e)
+            self.stored_msg_ids.clear()
+            await self.connection.close()
+            return
+        else:
+            _py_session.bisect.insort(self.stored_msg_ids, msg.msg_id)
+
+        if isinstance(msg.body, (_py_session.raw.types.MsgDetailedInfo, _py_session.raw.types.MsgNewDetailedInfo)):
+            self.pending_acks.add(msg.body.answer_msg_id)
+            continue
+
+        if isinstance(msg.body, _py_session.raw.types.NewSessionCreated):
+            continue
+
+        msg_id = None
+
+        if isinstance(msg.body, (_py_session.raw.types.BadMsgNotification, _py_session.raw.types.BadServerSalt)):
+            msg_id = msg.body.bad_msg_id
+        elif isinstance(msg.body, (_py_session.FutureSalts, _py_session.raw.types.RpcResult)):
+            msg_id = msg.body.req_msg_id
+        elif isinstance(msg.body, _py_session.raw.types.Pong):
+            msg_id = msg.body.msg_id
+        else:
+            if self.client is not None:
+                self.loop.create_task(self.client.handle_updates(msg.body))
+
+        if msg_id in self.results:
+            self.results[msg_id].value = getattr(msg.body, "result", msg.body)
+            self.results[msg_id].event.set()
+
+    if len(self.pending_acks) >= self.ACKS_THRESHOLD:
+        _py_session.log.debug("Sending %s acks", len(self.pending_acks))
+        try:
+            await self.send(_py_session.raw.types.MsgsAck(msg_ids=list(self.pending_acks)), False)
+        except OSError:
+            pass
+        else:
+            self.pending_acks.clear()
+
+_py_session.Session.handle_packet = _stabilized_handle_packet
+
+# Extend TCP transport socket timeout to prevent premature socket aborts
+import pyrogram.connection.transport.tcp as _tcp_mod
+_tcp_mod.TCP.TIMEOUT = int(max(60, getattr(config, "PYROGRAM_WAIT_TIMEOUT", 60)))
+
+# In-memory circular log handler to power /logs command
+from collections import deque
+
+class MemoryLogHandler(logging.Handler):
+    """In-memory circular log handler to power /logs command directly in Telegram."""
+    def __init__(self, capacity: int = 500):
+        super().__init__()
+        self.buffer = deque(maxlen=capacity)
+
+    def emit(self, record):
+        try:
+            self.buffer.append(self.format(record))
+        except Exception:
+            pass
+
+    def get_logs(self, count: int = 60) -> List[str]:
+        return list(self.buffer)[-count:]
+
+memory_log_handler = MemoryLogHandler()
+memory_log_handler.setLevel(logging.INFO)
+memory_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logging.root.setLevel(logging.INFO)
+logging.root.addHandler(memory_log_handler)
+
+# Fast parallel chunk uploader patch for Pyrogram
+import pyrogram.methods.advanced.save_file as _sf_mod
+
+_orig_pyrogram_save_file = _sf_mod.SaveFile.save_file
+
+async def _fast_save_file(
+    self: Client,
+    path,
+    file_id: int = None,
+    file_part: int = 0,
+    progress: _sf_mod.Callable = None,
+    progress_args: tuple = ()
+):
+    async with self.save_file_semaphore:
+        if path is None:
+            return None
+
+        queue = _sf_mod.asyncio.Queue(16)
+
+        async def worker(session):
+            while True:
+                data = await queue.get()
+                if data is None:
+                    return
+                try:
+                    await session.invoke(data)
+                except Exception as e:
+                    _sf_mod.log.exception(e)
+
+        part_size = 512 * 1024
+
+        if isinstance(path, (str, _sf_mod.PurePath)):
+            fp = open(path, "rb")
+        elif isinstance(path, _sf_mod.io.IOBase):
+            fp = path
+        else:
+            raise ValueError("Invalid file. Expected a file path as string or a binary file pointer")
+
+        file_name = getattr(fp, "name", "file.jpg")
+        fp.seek(0, _sf_mod.os.SEEK_END)
+        file_size = fp.tell()
+        fp.seek(0)
+
+        if file_size == 0:
+            raise ValueError("File size equals to 0 B")
+
+        file_size_limit_mib = 4000 if getattr(self, "me", None) and getattr(self.me, "is_premium", False) else 2000
+        if file_size > file_size_limit_mib * 1024 * 1024:
+            raise ValueError(f"Can't upload files bigger than {file_size_limit_mib} MiB")
+
+        file_total_parts = int(_sf_mod.math.ceil(file_size / part_size))
+        is_big = file_size > 10 * 1024 * 1024
+        # Use 8 pipelined workers to fill the Bandwidth-Delay Product (BDP) pipe across high-latency DC links
+        workers_count = 8 if is_big else 1
+        is_missing_part = file_id is not None
+        file_id = file_id or self.rnd_id()
+        md5_sum = _sf_mod.md5() if not is_big and not is_missing_part else None
+        session = _sf_mod.Session(
+            self, await self.storage.dc_id(), await self.storage.auth_key(),
+            await self.storage.test_mode(), is_media=True
+        )
+        workers = [self.loop.create_task(worker(session)) for _ in range(workers_count)]
+
+        try:
+            await session.start()
+            fp.seek(part_size * file_part)
+
+            while True:
+                chunk = fp.read(part_size)
+                if not chunk:
+                    if not is_big and not is_missing_part:
+                        md5_sum = "".join([hex(i)[2:].zfill(2) for i in md5_sum.digest()])
+                    break
+
+                if is_big:
+                    rpc = _sf_mod.raw.functions.upload.SaveBigFilePart(
+                        file_id=file_id,
+                        file_part=file_part,
+                        file_total_parts=file_total_parts,
+                        bytes=chunk
+                    )
+                else:
+                    rpc = _sf_mod.raw.functions.upload.SaveFilePart(
+                        file_id=file_id,
+                        file_part=file_part,
+                        bytes=chunk
+                    )
+
+                await queue.put(rpc)
+
+                if is_missing_part:
+                    return
+
+                if not is_big and not is_missing_part:
+                    md5_sum.update(chunk)
+
+                file_part += 1
+
+                if progress:
+                    func = _sf_mod.functools.partial(
+                        progress,
+                        min(file_part * part_size, file_size),
+                        file_size,
+                        *progress_args
+                    )
+                    if _sf_mod.inspect.iscoroutinefunction(progress):
+                        await func()
+                    else:
+                        await self.loop.run_in_executor(self.executor, func)
+        except _sf_mod.StopTransmission:
+            raise
+        except Exception as e:
+            _sf_mod.log.exception(e)
+        else:
+            if is_big:
+                return _sf_mod.raw.types.InputFileBig(
+                    id=file_id,
+                    parts=file_total_parts,
+                    name=file_name,
+                )
+            else:
+                return _sf_mod.raw.types.InputFile(
+                    id=file_id,
+                    parts=file_total_parts,
+                    name=file_name,
+                    md5_checksum=md5_sum
+                )
+        finally:
+            for _ in workers:
+                await queue.put(None)
+            await _sf_mod.asyncio.gather(*workers)
+            await session.stop()
+            if isinstance(path, (str, _sf_mod.PurePath)):
+                fp.close()
+
+_sf_mod.SaveFile.save_file = _fast_save_file
+Client.save_file = _fast_save_file
+
 from downloader import (
     extract_info,
     analyze_video_qualities,
@@ -41,9 +332,10 @@ from uploader import (
 
 logger = logging.getLogger(__name__)
 
-# Semaphore to govern concurrent downloads and protect 2 GB RAM server
-download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
-upload_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
+# Semaphore and lock to govern transfers and guarantee strict sequential execution
+transfer_lock = asyncio.Lock()
+download_semaphore = asyncio.Semaphore(1)
+upload_semaphore = asyncio.Semaphore(1)
 
 # Initialize Pyrogram Bot Client
 # API_ID and API_HASH default to fallback placeholders so unit tests can import safely
@@ -159,6 +451,8 @@ async def start_command(client: Client, message: Message):
         "📌 <b>Commands:</b>\n"
         "• <code>/video &lt;link&gt;</code> - Download a single video\n"
         "• <code>/playlist &lt;link&gt;</code> - Select & download from a playlist\n"
+        "• <code>/speedtest</code> - Test server network download & upload speeds\n"
+        "• <code>/logs</code> - View recent server logs directly on Telegram\n"
         "• <code>/help</code> - Detailed help and instructions\n\n"
         "Or simply paste any YouTube video or playlist link directly!"
     )
@@ -180,9 +474,105 @@ async def help_command(client: Client, message: Message):
         "• The bot displays 10 videos per page with clickable checkmarks.\n"
         "• Use <b>Next ➡️</b> and <b>⬅️ Prev</b> to browse pages.\n"
         "• Click <b>✅ Select All</b> to download the entire playlist at once.\n"
-        "• Click <b>📥 Download Selected</b> to pick your desired resolution."
+        "• Click <b>📥 Download Selected</b> to pick your desired resolution.\n\n"
+        "<b>3. Diagnostics:</b>\n"
+        "• <code>/speedtest</code> - Check server download & upload bandwidth\n"
+        "• <code>/logs</code> - View recent server application logs"
     )
     await message.reply_text(help_text)
+
+
+@app.on_message(filters.command("speedtest"))
+async def speedtest_command(client: Client, message: Message):
+    logger.info("📩 Received /speedtest command from chat_id=%s", message.chat.id)
+    status = await message.reply_text("🌐 <b>Running server network speed test...</b>\n\n📡 <i>Measuring latency...</i>")
+    try:
+        import aiohttp
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            # 1. Latency test
+            pings = []
+            for _ in range(3):
+                t0 = time.time()
+                async with session.get("https://speed.cloudflare.com/__down?bytes=0", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    await resp.read()
+                pings.append((time.time() - t0) * 1000)
+            avg_ping = sum(pings) / len(pings)
+
+            # 2. Download test (15 MB)
+            await status.edit_text(
+                f"🌐 <b>Running server network speed test...</b>\n\n"
+                f"📡 Latency: <code>{avg_ping:.0f} ms</code>\n"
+                f"📥 <i>Testing download speed (15 MB)...</i>"
+            )
+            t0 = time.time()
+            async with session.get("https://speed.cloudflare.com/__down?bytes=15000000", timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                data = await resp.read()
+            down_sec = max(0.001, time.time() - t0)
+            down_bytes = len(data)
+            down_mbs = (down_bytes / (1024 * 1024)) / down_sec
+            down_mbps = (down_bytes * 8) / (down_sec * 1_000_000)
+
+            # 3. Upload test (10 MB)
+            await status.edit_text(
+                f"🌐 <b>Running server network speed test...</b>\n\n"
+                f"📡 Latency: <code>{avg_ping:.0f} ms</code>\n"
+                f"📥 Download: <code>{down_mbs:.2f} MB/s • {down_mbps:.1f} Mbps</code>\n"
+                f"📤 <i>Testing upload speed (10 MB)...</i>"
+            )
+            up_payload = b"0" * (10 * 1024 * 1024)
+            t0 = time.time()
+            async with session.post("https://speed.cloudflare.com/__up", data=up_payload, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                await resp.read()
+            up_sec = max(0.001, time.time() - t0)
+            up_mbs = (len(up_payload) / (1024 * 1024)) / up_sec
+            up_mbps = (len(up_payload) * 8) / (up_sec * 1_000_000)
+
+            result_text = (
+                f"🌐 <b>SERVER SPEED TEST RESULTS</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📥 <b>Download:</b> <code>{down_mbs:.2f} MB/s • {down_mbps:.1f} Mbps</code>\n"
+                f"📤 <b>Upload:</b> <code>{up_mbs:.2f} MB/s • {up_mbps:.1f} Mbps</code>\n"
+                f"📡 <b>Latency:</b> <code>{avg_ping:.0f} ms</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"ℹ️ <i>Measured directly on server host via Cloudflare edge.</i>"
+            )
+            await status.edit_text(result_text)
+    except Exception as e:
+        logger.error("Speedtest failed: %s", e)
+        try:
+            await status.edit_text(f"❌ <b>Speed test failed:</b>\n<code>{str(e)[:300]}</code>")
+        except Exception:
+            pass
+
+
+@app.on_message(filters.command("logs"))
+async def logs_command(client: Client, message: Message):
+    logger.info("📩 Received /logs command from chat_id=%s", message.chat.id)
+    recent_logs = memory_log_handler.get_logs(count=60)
+    if not recent_logs:
+        await message.reply_text("📋 <i>No logs recorded in memory yet.</i>")
+        return
+
+    joined_text = "\n".join(recent_logs)
+    if len(joined_text) <= 3500:
+        await message.reply_text(f"📋 <b>Recent Server Logs:</b>\n\n<code>{joined_text}</code>")
+    else:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
+            all_logs = memory_log_handler.get_logs(count=300)
+            f.write("\n".join(all_logs))
+            tmp_path = f.name
+        try:
+            preview = "\n".join(recent_logs[-15:])
+            if len(preview) > 2500:
+                preview = preview[-2500:]
+            await message.reply_document(
+                document=tmp_path,
+                file_name="bot_logs.txt",
+                caption=f"📋 <b>Recent Server Logs:</b>\n\n<code>{preview}</code>"
+            )
+        finally:
+            safe_cleanup(tmp_path)
 
 
 def format_playlist_caption(session: PlaylistSession) -> str:
@@ -750,67 +1140,118 @@ async def process_playlist_downloads(
     entries: List[dict],
     quality_key: str,
 ):
-    """Upload a finished file while downloading exactly one next playlist item."""
+    """Process playlist downloads. Sequentially by default to prevent download and upload bandwidth contention."""
     total = len(entries)
     successful = 0
     failed = 0
 
-    async def prepare_item(idx, entry):
-        video_title = entry.get("title", f"Video {idx}")
-        video_url = entry.get("url") or ""
-        video_id = entry.get("id") or ""
-        if not video_url or not video_url.startswith("http"):
-            if video_id:
-                video_url = f"https://www.youtube.com/watch?v={video_id}"
-            elif video_url:
-                video_url = f"https://www.youtube.com/watch?v={video_url}"
-
-        item_status = None
+    if not entries:
         try:
-            # Create a separate status tracker for individual video progress
-            item_status = await client.send_message(
-                chat_id=chat_id,
-                text=f"📥 <i>[{idx}/{total}] Downloading:</i> <b>{video_title}</b>",
+            await status_msg.edit_text(
+                "🎉 <b>Playlist Download Completed!</b>\n\n✅ <b>Successfully sent:</b> 0 / 0"
             )
-            result = await prepare_download(item_status, video_url, quality_key)
-            return item_status, video_url, result
         except Exception as e:
-            logger.error("Failed playlist item %d (%s): %s", idx, video_url, e)
-            if item_status:
-                try:
-                    await item_status.edit_text(f"❌ <b>Download Failed:</b>\n<code>{str(e)[:300]}</code>")
-                except Exception:
-                    pass
-            return None
+            logger.debug("Final status edit skipped: %s", e)
+        return
 
-    pending = asyncio.create_task(prepare_item(1, entries[0])) if entries else None
-    try:
-        for offset in range(total):
-            prepared = await asyncio.shield(pending)
-            pending = None
-            # Bound disk usage to the uploading file plus one prefetched file.
-            if offset + 1 < total:
-                pending = asyncio.create_task(prepare_item(offset + 2, entries[offset + 1]))
+    if getattr(config, "PREFETCH_PLAYLIST", False):
+        # Prefetch pipeline: overlap next download with current upload
+        async def prepare_item(idx, entry):
+            video_title = entry.get("title", f"Video {idx}")
+            video_url = entry.get("url") or ""
+            video_id = entry.get("id") or ""
+            if not video_url or not video_url.startswith("http"):
+                if video_id:
+                    video_url = f"https://www.youtube.com/watch?v={video_id}"
+                elif video_url:
+                    video_url = f"https://www.youtube.com/watch?v={video_url}"
+
+            item_status = None
+            try:
+                item_status = await client.send_message(
+                    chat_id=chat_id,
+                    text=f"📥 <i>[{idx}/{total}] Downloading:</i> <b>{video_title}</b>",
+                )
+                result = await prepare_download(item_status, video_url, quality_key)
+                return item_status, video_url, result
+            except Exception as e:
+                logger.error("Failed playlist item %d (%s): %s", idx, video_url, e)
+                if item_status:
+                    try:
+                        await item_status.edit_text(f"❌ <b>Download Failed:</b>\n<code>{str(e)[:300]}</code>")
+                    except Exception:
+                        pass
+                return None
+
+        pending = asyncio.create_task(prepare_item(1, entries[0])) if entries else None
+        try:
+            for offset in range(total):
+                prepared = await asyncio.shield(pending)
+                pending = None
+                # Bound disk usage to the uploading file plus one prefetched file.
+                if offset + 1 < total:
+                    pending = asyncio.create_task(prepare_item(offset + 2, entries[offset + 1]))
+                if prepared is None:
+                    failed += 1
+                    continue
+                item_status, video_url, result = prepared
+                try:
+                    success = await process_single_download(
+                        client, item_status, chat_id, video_url, quality_key,
+                        prepared_result=result,
+                    )
+                finally:
+                    safe_cleanup(result.temp_dir)
+                successful += int(success)
+                failed += int(not success)
+        finally:
+            if pending is not None:
+                prepared = await pending
+                if prepared:
+                    safe_cleanup(prepared[2].temp_dir)
+    else:
+        # Sequential pipeline: clean download followed by maximum speed upload
+        for idx, entry in enumerate(entries, start=1):
+            video_title = entry.get("title", f"Video {idx}")
+            video_url = entry.get("url") or ""
+            video_id = entry.get("id") or ""
+            if not video_url or not video_url.startswith("http"):
+                if video_id:
+                    video_url = f"https://www.youtube.com/watch?v={video_id}"
+                elif video_url:
+                    video_url = f"https://www.youtube.com/watch?v={video_url}"
+
+            item_status = None
+            prepared = None
+            try:
+                item_status = await client.send_message(
+                    chat_id=chat_id,
+                    text=f"📥 <i>[{idx}/{total}] Downloading:</i> <b>{video_title}</b>",
+                )
+                prepared = await prepare_download(item_status, video_url, quality_key)
+            except Exception as e:
+                logger.error("Failed playlist download item %d (%s): %s", idx, video_url, e)
+                if item_status:
+                    try:
+                        await item_status.edit_text(f"❌ <b>Download Failed:</b>\n<code>{str(e)[:300]}</code>")
+                    except Exception:
+                        pass
+                failed += 1
+                continue
+
             if prepared is None:
                 failed += 1
                 continue
-            item_status, video_url, result = prepared
+
             try:
                 success = await process_single_download(
                     client, item_status, chat_id, video_url, quality_key,
-                    prepared_result=result,
+                    prepared_result=prepared,
                 )
             finally:
-                safe_cleanup(result.temp_dir)
+                safe_cleanup(prepared.temp_dir)
             successful += int(success)
             failed += int(not success)
-    finally:
-        # Executor downloads cannot be stopped safely by cancelling their
-        # awaiter. Drain the sole prefetched item before removing its files.
-        if pending is not None:
-            prepared = await pending
-            if prepared:
-                safe_cleanup(prepared[2].temp_dir)
 
     summary_text = (
         f"🎉 <b>Playlist Download Completed!</b>\n\n"

@@ -33,7 +33,8 @@ async def test_playlist_overlaps_next_download_with_upload_and_preserves_order()
     client = SimpleNamespace(send_message=AsyncMock(return_value=AsyncMock()))
     status = AsyncMock()
     entries = [{"id": name} for name in ("one", "two", "three")]
-    with patch.object(bot, "prepare_download", side_effect=prepare), \
+    with patch.object(config, "PREFETCH_PLAYLIST", True), \
+         patch.object(bot, "prepare_download", side_effect=prepare), \
          patch.object(bot, "process_single_download", side_effect=upload), \
          patch.object(bot, "safe_cleanup") as cleanup:
         task = asyncio.create_task(bot.process_playlist_downloads(client, status, 1, entries, "720"))
@@ -44,6 +45,46 @@ async def test_playlist_overlaps_next_download_with_upload_and_preserves_order()
         await asyncio.wait_for(task, 2)
     assert uploaded == downloads
     assert cleanup.call_count == 3
+    assert "3 / 3" in status.edit_text.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_playlist_sequential_processing_when_prefetch_disabled():
+    uploaded = []
+    downloads = []
+    in_flight_operations = 0
+    max_concurrent = 0
+
+    async def prepare(message, url, quality):
+        nonlocal in_flight_operations, max_concurrent
+        in_flight_operations += 1
+        max_concurrent = max(max_concurrent, in_flight_operations)
+        downloads.append(url)
+        await asyncio.sleep(0.01)
+        in_flight_operations -= 1
+        return result(url)
+
+    async def upload(*args, prepared_result):
+        nonlocal in_flight_operations, max_concurrent
+        in_flight_operations += 1
+        max_concurrent = max(max_concurrent, in_flight_operations)
+        uploaded.append(args[3])
+        await asyncio.sleep(0.01)
+        in_flight_operations -= 1
+        return True
+
+    client = SimpleNamespace(send_message=AsyncMock(return_value=AsyncMock()))
+    status = AsyncMock()
+    entries = [{"id": name} for name in ("one", "two", "three")]
+    with patch.object(config, "PREFETCH_PLAYLIST", False), \
+         patch.object(bot, "prepare_download", side_effect=prepare), \
+         patch.object(bot, "process_single_download", side_effect=upload), \
+         patch.object(bot, "safe_cleanup") as cleanup:
+        await bot.process_playlist_downloads(client, status, 1, entries, "720")
+
+    assert uploaded == downloads
+    assert cleanup.call_count == 3
+    assert max_concurrent == 1  # Never overlaps download and upload!
     assert "3 / 3" in status.edit_text.call_args.args[0]
 
 
@@ -78,7 +119,8 @@ async def test_cancelled_playlist_drains_and_cleans_prefetch():
         return result("prefetch")
 
     client = SimpleNamespace(send_message=AsyncMock(return_value=AsyncMock()))
-    with patch.object(bot, "prepare_download", side_effect=prepare), \
+    with patch.object(config, "PREFETCH_PLAYLIST", True), \
+         patch.object(bot, "prepare_download", side_effect=prepare), \
          patch.object(bot, "safe_cleanup") as cleanup:
         task = asyncio.create_task(bot.process_playlist_downloads(client, AsyncMock(), 1, [{"id": "one"}], "720"))
         await started.wait()
