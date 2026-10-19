@@ -187,16 +187,29 @@ reserving another 1.5 GB for merging. This uses Telegram's documented
 [streamed-upload protocol](https://core.telegram.org/api/files#streamed-uploads),
 including unknown part counts until EOF; Telegram assembles one final video.
 
-The direct downloader requests small HTTP ranges in parallel (4 connections
-and 1 MiB ranges per input by default), preserving byte order and supporting
+The direct downloader requests small HTTP ranges in parallel (8 connections
+and 2 MiB ranges per input by default), preserving byte order and supporting
 FFmpeg seeks. This avoids depending on one unbounded CDN request. A loopback
 HTTP input connects FFmpeg to these reads; CDN traffic itself is always direct.
 Range responses and byte counts are validated before forwarding. Sources that
 ignore Range stay on direct FFmpeg input. No paid proxy fallback is used.
 
-`STREAM_BUFFER_MB=32` lets FFmpeg run ahead of Telegram within a fixed memory
+`STREAM_BUFFER_MB=128` lets FFmpeg run ahead of Telegram within a fixed memory
 budget. Uploads pipeline `UPLOAD_REQUESTS_PER_CONNECTION=4` requests per
-`UPLOAD_WORKERS=4` connections (16 chunks / 8 MiB in flight by default).
+`UPLOAD_WORKERS=8` connections (32 chunks / 16 MiB in flight initially).
+`UPLOAD_ADAPTIVE=true` reserves a pool up to `UPLOAD_MAX_WORKERS=16`
+connections and tests increasing active connections, then request depth up to
+`UPLOAD_MAX_REQUESTS_PER_CONNECTION=8` (128 chunks / 64 MiB maximum in flight).
+Only saturated transfers with queued bytes are expanded. Each setting is
+measured over two `UPLOAD_TUNE_INTERVAL=5` second samples. A trial must improve
+throughput by at least 10% to be kept; otherwise the previous setting is restored
+and probing stops for that transfer. Retries or FloodWait trigger backoff.
+Requests already in flight finish normally when the window shrinks.
+
+`CRYPTO_WORKERS=4` replaces Pyrogram's shared single-worker encryption pool
+before connecting the bot, allowing packet encryption/decryption to run on
+multiple threads. TgCrypto remains required for native cryptographic acceleration.
+FFmpeg continues stream-copying without re-encoding or changing quality.
 Free connection slots take the next chunk; slow connections do not hold up
 healthy ones. Sessions start concurrently, and status edits run outside the
 data path. These buffers plus CDN ranges and subprocess/network/FFmpeg buffers
@@ -208,12 +221,19 @@ counts still enforce `MAX_FILE_SIZE` and the standard 2000 MiB upload ceiling.
 Transfer speed depends on CDN and Telegram throughput as well as server bandwidth.
 
 FFmpeg must be installed and on PATH. `STREAM_READ_TIMEOUT=90` bounds a stalled
-source; `UPLOAD_WORKERS=4` controls upload parallelism (clamped to 1–16).
+source; `UPLOAD_WORKERS=8` controls initial upload parallelism (clamped to 1–16).
 `STREAM_PARALLEL_DOWNLOADS=false` disables parallel ranges for troubleshooting;
 `STREAM_DOWNLOAD_WORKERS` (1–8) and `STREAM_DOWNLOAD_CHUNK_KB` (256–4096) tune
-CDN reads. `STREAM_BUFFER_MB` is clamped to 1–64 and
+CDN reads. `STREAM_BUFFER_MB` is clamped to 1–256 and
 `UPLOAD_REQUESTS_PER_CONNECTION` to 1–8. Larger values consume more memory
 and cannot overcome an upstream CDN or Telegram route bandwidth limit.
+At the default maximum, queued MP4 bytes, upload chunk payloads and two inputs'
+CDN ranges account for about 224 MiB, plus encryption copies, FFmpeg, sockets
+and the application. This is a bounded use of the available RAM, not an attempt
+to fill it. `UPLOAD_ADAPTIVE=false` retains a fixed upload window. Crypto worker
+threads are clamped to 1–8. Existing environment values override new defaults;
+update old `UPLOAD_WORKERS=4`, `STREAM_BUFFER_MB=32` and download settings if
+you want the new initial profile. `/logs` records every adaptive window change.
 Set `STREAM_VIDEO_UPLOADS=false` to use the regular disk path.
 Audio conversion and sources without complete HTTP MP4/M4A resources (such as
 manifest-only formats) also use that path. Its temporary storage is bounded by

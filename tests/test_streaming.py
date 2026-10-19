@@ -16,6 +16,13 @@ import streaming
 from streaming import PART_SIZE, StreamPlan
 
 
+@pytest.fixture(autouse=True)
+def fixed_upload_window(monkeypatch):
+    # Existing protocol tests exercise fixed windows; adaptive behavior has its
+    # own deterministic controller tests and an integration test below.
+    monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", False)
+
+
 def metadata():
     return {"title": "A <good> video", "duration": 20, "formats": [
         {"url": "https://cdn.example/video", "protocol": "https", "ext": "mp4",
@@ -50,7 +57,7 @@ def telegram(monkeypatch):
             self.invoke = AsyncMock(side_effect=self.save)
             sessions.append(self)
 
-        async def save(self, rpc):
+        async def save(self, rpc, **kwargs):
             calls.append(rpc)
             return True
 
@@ -161,7 +168,7 @@ async def test_slow_telegram_bounds_prefetch_and_cancellation_cleans_sessions(mo
     release = asyncio.Event()
     stopped = AsyncMock()
 
-    async def invoke(rpc):
+    async def invoke(rpc, **kwargs):
         await release.wait()
         return True
 
@@ -217,7 +224,7 @@ async def test_1_5_gib_stream_with_tiny_disk_budget(monkeypatch):
             self.remaining -= count
             return payload
 
-    async def invoke(rpc):
+    async def invoke(rpc, **kwargs):
         nonlocal parts_sent, bytes_sent
         parts_sent += 1
         bytes_sent += len(rpc.bytes)
@@ -263,7 +270,7 @@ async def test_fast_connection_keeps_working_while_another_is_slow(monkeypatch):
             sessions.append(self)
             self.start, self.stop = AsyncMock(), AsyncMock()
 
-        async def invoke(self, rpc):
+        async def invoke(self, rpc, **kwargs):
             i = self.index
             loads[i] += 1
             peaks[i] = max(peaks[i], loads[i])
@@ -323,6 +330,47 @@ async def test_speed_probe_uses_actual_parallel_pipeline(telegram):
     assert rate > 0
     assert sum(len(r.bytes) for r in telegram[0]) == PART_SIZE * 24
     assert all(s.stop.await_count == 1 for s in telegram[1])
+
+
+@pytest.mark.asyncio
+async def test_adaptive_upload_activates_extra_connections_and_cleans_entire_pool(monkeypatch):
+    monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", True)
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 1)
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 1)
+    monkeypatch.setattr(config, "UPLOAD_MAX_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 2)
+    monkeypatch.setattr(config, "UPLOAD_TUNE_INTERVAL", 0.03)
+    expanded = asyncio.Event()
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            self.index = len(sessions)
+            sessions.append(self)
+            self.start, self.stop = AsyncMock(), AsyncMock()
+
+        async def invoke(self, rpc, **kwargs):
+            if self.index == 1:
+                expanded.set()
+            await asyncio.sleep(0.02)
+            return True
+
+    monkeypatch.setattr(streaming, "Session", FakeSession)
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(PART_SIZE * 30))
+    reader.feed_eof()
+    stats = streaming.TransferStats()
+    task = asyncio.create_task(streaming.upload_stream(fake_client(), reader, "test.mp4", stats=stats))
+    try:
+        await asyncio.wait_for(expanded.wait(), 2)
+        assert stats.active_connections == 2
+        _, size = await asyncio.wait_for(task, 3)
+        assert size == PART_SIZE * 30
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert len(sessions) == 2 and all(s.stop.await_count == 1 for s in sessions)
 
 
 @pytest.mark.asyncio

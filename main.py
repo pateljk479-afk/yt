@@ -10,6 +10,7 @@ from web import start_web_server
 from proxy_check import check_proxy
 from downloader import get_js_runtimes
 from storage import cleanup_stale_downloads
+from upload_tuning import configure_crypto_workers
 
 # Configure structured logging
 logging.basicConfig(
@@ -37,6 +38,7 @@ async def main():
         logger.error("Refer to .env.example and README.md for setup instructions.")
         sys.exit(1)
 
+    configure_crypto_workers()
     logger.info("Performance & Environment settings:")
     logger.info("  - Telegram Max File Size: %d MB", config.MAX_FILE_SIZE // (1024 * 1024))
     logger.info("  - Video transfers: %s", "direct streaming (no media files on disk)"
@@ -44,6 +46,8 @@ async def main():
     logger.info("  - Telegram upload pipeline: %d connections x %d requests; %d MiB stream buffer",
                 max(1, min(config.UPLOAD_WORKERS, 16)), config.UPLOAD_REQUESTS_PER_CONNECTION,
                 config.STREAM_BUFFER_BYTES // (1024 * 1024))
+    logger.info("  - Adaptive upload: %s; ceiling %d connections x %d requests",
+                config.UPLOAD_ADAPTIVE, config.UPLOAD_MAX_WORKERS, config.UPLOAD_MAX_REQUESTS_PER_CONNECTION)
     logger.info("  - Max Concurrent Downloads: %d", config.MAX_CONCURRENT_DOWNLOADS)
     logger.info("  - Fragment Parallel Streams: %d", config.CONCURRENT_FRAGMENT_DOWNLOADS)
     logger.info("  - aria2c Accelerated Downloader: %s", "Enabled" if config.ARIA2C_AVAILABLE else "Disabled (yt-dlp native multithread)")

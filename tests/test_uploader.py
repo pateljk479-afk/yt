@@ -154,7 +154,7 @@ async def test_fast_save_file_multi_session():
         with patch.object(_sf_mod, "Session", FakeSession):
             result = await _fast_save_file(client, tmp_path, progress=mock_progress)
             assert result is not None
-            assert len(created_sessions) == 4
+            assert len(created_sessions) == bot.config.UPLOAD_WORKERS
             assert all(s.start.called for s in created_sessions)
             assert all(s.stop.called for s in created_sessions)
             assert len(progress_calls) > 0
