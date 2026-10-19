@@ -7,7 +7,8 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 ## 🌟 Key Features
 
 1. **⚡ Maximum Speed Optimization (600 Mbps Tuned)**
-   - **Multi-fragment parallel streaming**: `yt-dlp` configured with `concurrent_fragment_downloads = 16` and 10 MB HTTP chunks to maximize bandwidth and bypass single-stream CDN throttling.
+   - **Video streaming without disk copies**: direct CDN inputs are merged by FFmpeg and uploaded immediately in 512 KiB Telegram chunks, with bounded memory and parallel upload connections.
+   - **Regular downloader acceleration**: audio and manifest-only sources use yt-dlp fragment downloads and 10 MB HTTP chunks.
    - **C-accelerated MTProto encryption**: Integrates `TgCrypto` for lightning-fast Telegram chunk uploads.
    - **Aria2c integration**: Automatically detects and uses `aria2c` with 16 parallel connections if available on the system.
    - **Memory-bounded concurrency**: Protected by an `asyncio.Semaphore` queue to fully utilize 4 CPU cores while preventing Out-Of-Memory (OOM) errors on 2 GB RAM servers.
@@ -30,8 +31,8 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 4. **🎞️ Original Titles, Thumbnails & Streamable MP4 Container**
    - **Original Title**: Preserves the exact title from YouTube as the video file name (safely sanitized against filesystem illegal characters).
    - **Original Thumbnail**: Extracts and converts the video thumbnail to standard JPEG format (scaled to max 320x320) so the Telegram player displays it crisp and clear.
-   - **Non-Corrupted MP4**: Applies FFmpeg post-processing with `-movflags +faststart` (moov atom placed at front) so videos stream immediately inside Telegram without buffering.
-   - **Integrity Validation**: Automated pre-upload validation using container header and `ffprobe` inspection.
+   - **Streamable MP4**: the streaming path produces fragmented MP4 with the initialization metadata at the front, without re-encoding. The disk path uses `-movflags +faststart`.
+   - **Integrity Validation**: streamed videos require an MP4 header, successful FFmpeg completion and a duration check before publishing. Disk downloads use container header and `ffprobe` inspection.
 
 5. **☁️ Cloud-Ready & Render Deployment**
    - Built-in lightweight `aiohttp` web server responding on `GET /` and `GET /health` to satisfy Render's port binding and HTTP health check requirements.
@@ -47,6 +48,7 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 ├── config.py               # Environment variables, tuning parameters, and limits
 ├── bot.py                  # Pyrogram bot client, commands, and callback query handlers
 ├── downloader.py           # yt-dlp integration, 2GB filtering, size estimation & downloads
+├── streaming.py            # Direct FFmpeg muxing and bounded Telegram streamed uploads
 ├── keyboards.py            # Telegram inline keyboards (quality selection & playlist pagination)
 ├── session_manager.py      # In-memory session state for playlist pagination & selections
 ├── uploader.py             # Progress formatting, JPEG thumbnail conversion & MP4 validation
@@ -138,11 +140,12 @@ python main.py
 3. User navigates with `Next ➡️` / `⬅️ Prev` or clicks `✅ Select All`.
 4. User clicks `📥 Download Selected (N)`.
 5. User selects desired quality.
-6. Bot uploads each completed video while downloading the next selected video.
-   Upload order is preserved, with at most one next video prefetched per playlist.
-   Each file finishes downloading, merging and verification before its upload;
-   single-video downloads retain that safe sequence. Progress-bar edits are
-   at least five seconds apart (`PROGRESS_UPDATE_INTERVAL`, minimum 5).
+6. Bot downloads, merges and uploads each video together, preserving playlist order.
+   The completed video appears as one Telegram message after successful transfer.
+   Optional `PREFETCH_PLAYLIST=true` prepares the next video's metadata; streamed
+   media is only fetched when its transfer starts. For audio and manifest-only
+   sources, prefetch downloads the next file to disk. Progress-bar edits are at
+   least five seconds apart (`PROGRESS_UPDATE_INTERVAL`, minimum 5).
 
 ---
 
@@ -175,21 +178,40 @@ python main.py
 
 ### Minimizing paid YouTube proxy traffic
 
-Temporary storage is bounded by `DOWNLOAD_STORAGE_LIMIT_MB` (default 1536 MB
-for a 2 GB server), with `MIN_FREE_DISK_MB=128` physical free space reserved.
-The effective file limit is storage budget / 3 (512 MB by default), allowing
-space for one uploaded file, the next downloaded streams, and merging.
-Lower qualities may therefore be offered on small servers. Failed download
-folders are removed immediately; startup removes only abandoned `yt_dl_*`
+`STREAM_VIDEO_UPLOADS=true` is the default. For normal on-demand HTTP MP4/M4A
+streams the flow is **YouTube CDN → FFmpeg stream copy → Telegram chunk upload**.
+No complete input, merged output, or video chunk files are written to disk.
+This allows a 1.5 GB video to transfer on a server with a 2 GB disk without
+reserving another 1.5 GB for merging. This uses Telegram's documented
+[streamed-upload protocol](https://core.telegram.org/api/files#streamed-uploads),
+including unknown part counts until EOF; Telegram assembles one final video.
+
+Uploads retain at most twice `UPLOAD_WORKERS` chunks of 512 KiB (4 MiB with
+the default 4 workers), plus subprocess, network and FFmpeg buffers. A slower
+Telegram connection pauses reading, which also pauses FFmpeg and the CDN input.
+Chunks retry up to five times while their bytes remain in memory. Failed chunks,
+source timeouts and cancellation stop the transfer and close the upload sessions.
+Incomplete or failed FFmpeg output is never published to the chat. Actual byte
+counts still enforce `MAX_FILE_SIZE` and the standard 2000 MiB upload ceiling.
+Transfer speed depends on CDN and Telegram throughput as well as server bandwidth.
+
+FFmpeg must be installed and on PATH. `STREAM_READ_TIMEOUT=90` bounds a stalled
+source; `UPLOAD_WORKERS=4` controls upload parallelism (clamped to 1–16).
+Set `STREAM_VIDEO_UPLOADS=false` to use the regular disk path.
+Audio conversion and sources without complete HTTP MP4/M4A resources (such as
+manifest-only formats) also use that path. Its temporary storage is bounded by
+`DOWNLOAD_STORAGE_LIMIT_MB` (default 1536 MiB) and `MIN_FREE_DISK_MB=128`.
+It still needs room for the downloaded inputs and merged/converted output.
+Failed folders are removed immediately; startup removes only abandoned `yt_dl_*`
 folders inside `DOWNLOAD_DIR`, not cookies, sessions or other server files.
-These guards abort transfers when space is low; they cannot enforce the
-hosting provider's total quota or account for unrelated files elsewhere.
 
 With `YOUTUBE_PROXY` configured, YouTube metadata uses the proxy, but video,
-audio and thumbnails ALWAYS use direct server connections. Native
-yt-dlp downloading is used instead of aria2 so request routing is enforced.
-Logs report direct routing. Telegram uploads and local FFmpeg merging do not
-use this proxy.
+audio and thumbnails ALWAYS use direct server connections. The streaming
+FFmpeg process explicitly disables HTTP proxies and removes inherited proxy
+environment variables; only complete HTTP resources are accepted as inputs.
+For the regular disk path, native yt-dlp downloading is used instead of aria2
+so request routing is enforced. Logs report direct routing. Telegram uploads
+do not use the YouTube proxy.
 
 Media proxy fallback has been removed entirely. Any old
 `YOUTUBE_MEDIA_PROXY_FALLBACK` environment value is ignored, even `true`.

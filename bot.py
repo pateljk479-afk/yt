@@ -380,6 +380,7 @@ from downloader import (
     sanitize_filename,
     validate_youtube_cookie_file,
 )
+from streaming import StreamPlan, UnsupportedStream, prepare_stream, stream_video
 from session_manager import session_manager, PlaylistSession, VideoSession
 from keyboards import (
     build_playlist_keyboard,
@@ -1107,13 +1108,20 @@ async def callback_vid_start_download(client: Client, callback: CallbackQuery):
 # =====================================================================
 
 async def prepare_download(status_msg, url, quality_key, max_quality_height=None):
-    """Release the download slot before upload, and drain workers on cancel."""
+    """Prepare stream metadata or a disk download; drain workers on cancel."""
     updater = ThrottledProgressUpdater(status_msg, stage="Downloading 📥")
     try:
         async with download_semaphore:
             await status_msg.edit_text("⚡ <b>Starting high-speed download...</b>")
-            worker = asyncio.create_task(asyncio.to_thread(
-                download_media, url, quality_key, updater.sync_hook, max_quality_height))
+            def prepare():
+                if config.STREAM_VIDEO_UPLOADS and quality_key != "audio":
+                    try:
+                        return prepare_stream(url, quality_key, updater.sync_hook, max_quality_height)
+                    except UnsupportedStream as exc:
+                        logger.info("Using disk downloader for this source: %s", exc)
+                return download_media(url, quality_key, updater.sync_hook, max_quality_height)
+
+            worker = asyncio.create_task(asyncio.to_thread(prepare))
             try:
                 return await asyncio.shield(worker)
             except asyncio.CancelledError:
@@ -1144,6 +1152,19 @@ async def process_single_download(
             if result is None:
                 result = await prepare_download(status_msg, url, quality_key, max_quality_height)
             temp_dir = result.temp_dir
+
+            if isinstance(result, StreamPlan):
+                updater.stage = "Transferring to Telegram 📤"
+                await status_msg.edit_text(
+                    "📤 <i>Downloading and uploading your video together...</i>\n"
+                    "The complete video will appear here when the transfer finishes.")
+                async with download_semaphore:
+                    await stream_video(client, chat_id, result, updater.async_upload_hook)
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                return True
 
             # Verify integrity
             await status_msg.edit_text("🔍 <i>Verifying media stream integrity...</i>")
@@ -1232,6 +1253,7 @@ async def process_single_download(
                 pass
             return False
         finally:
+            updater.active = False
             if temp_dir:
                 safe_cleanup(temp_dir)
 
