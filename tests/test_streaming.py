@@ -374,6 +374,111 @@ async def test_adaptive_upload_activates_extra_connections_and_cleans_entire_poo
 
 
 @pytest.mark.asyncio
+async def test_transient_network_retry_does_not_collapse_upload_parallelism(monkeypatch):
+    monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", True)
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_MAX_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 1)
+    monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 1)
+    monkeypatch.setattr(config, "UPLOAD_TUNE_INTERVAL", 0.02)
+    failed = False
+
+    async def invoke(rpc, **kwargs):
+        nonlocal failed
+        if rpc.file_part == 0 and not failed:
+            failed = True
+            raise OSError("temporary connection problem")
+        await asyncio.sleep(0.01)
+        return True
+
+    monkeypatch.setattr(streaming, "Session", Mock(return_value=SimpleNamespace(
+        start=AsyncMock(), stop=AsyncMock(), invoke=invoke)))
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(PART_SIZE * 20 + 7))
+    reader.feed_eof()
+    stats = streaming.TransferStats()
+    await asyncio.wait_for(streaming.upload_stream(fake_client(), reader, "retry.mp4", stats=stats), 3)
+    assert stats.retry_events == 1 and stats.throttle_events == 0
+    assert stats.active_connections == 2 and stats.request_capacity == 2
+
+
+@pytest.mark.asyncio
+async def test_real_floodwait_pauses_new_chunks_and_invalidates_warm_profile(monkeypatch):
+    from pyrogram.errors import FloodWait
+    import time
+    monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", True)
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_MAX_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 1)
+    monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 1)
+    monkeypatch.setattr(config, "UPLOAD_TUNE_INTERVAL", 0.02)
+    first_throttle = None
+    later_chunks = []
+
+    async def invoke(rpc, **kwargs):
+        nonlocal first_throttle
+        if rpc.file_part == 0 and first_throttle is None:
+            first_throttle = time.monotonic()
+            raise FloodWait(1)
+        if rpc.file_part > 1:
+            later_chunks.append(time.monotonic())
+        await asyncio.sleep(0)
+        return True
+
+    monkeypatch.setattr(streaming, "Session", Mock(return_value=SimpleNamespace(
+        start=AsyncMock(), stop=AsyncMock(), invoke=invoke)))
+    client = fake_client()
+    client._bot_upload_profile = "previous setting"
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(PART_SIZE * 5 + 7))
+    reader.feed_eof()
+    stats = streaming.TransferStats()
+    await asyncio.wait_for(streaming.upload_stream(client, reader, "flood.mp4", stats=stats), 3)
+    assert stats.throttle_events == 1 and stats.retry_events == 1
+    assert client._bot_upload_profile is None
+    assert later_chunks and min(later_chunks) - first_throttle >= 0.95
+
+
+@pytest.mark.asyncio
+async def test_consecutive_files_reuse_confirmed_fast_setting_without_leaking_sessions(monkeypatch):
+    monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", True)
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 1)
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 1)
+    monkeypatch.setattr(config, "UPLOAD_MAX_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 2)
+    monkeypatch.setattr(config, "UPLOAD_TUNE_INTERVAL", 0.03)
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            self.start, self.stop = AsyncMock(), AsyncMock()
+            sessions.append(self)
+
+        async def invoke(self, rpc, **kwargs):
+            await asyncio.sleep(0.02)
+            return True
+
+    monkeypatch.setattr(streaming, "Session", FakeSession)
+    client = fake_client()
+    first = asyncio.StreamReader()
+    first.feed_data(media_bytes(PART_SIZE * 64))
+    first.feed_eof()
+    await asyncio.wait_for(streaming.upload_stream(client, first, "first.mp4"), 4)
+    profile = client._bot_upload_profile
+    assert profile.setting[0] == 2
+    # Observe the warm start itself, without a later adaptive trial changing
+    # the final window before the assertion.
+    monkeypatch.setattr(config, "UPLOAD_TUNE_INTERVAL", 10)
+    second = asyncio.StreamReader()
+    second.feed_data(media_bytes(PART_SIZE * 4))
+    second.feed_eof()
+    stats = streaming.TransferStats()
+    await asyncio.wait_for(streaming.upload_stream(client, second, "second.mp4", stats=stats), 2)
+    assert (stats.active_connections, stats.request_capacity) == (profile.setting[0], profile.setting[0] * profile.setting[1])
+    assert len(sessions) == 4 and all(s.stop.await_count == 1 for s in sessions)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("returncode,diagnostics", [
     (1, b"failure"), (0, b"out_time_us=1000000\nprogress=end\n")])
 async def test_bad_or_truncated_ffmpeg_output_is_not_published(monkeypatch, telegram, returncode, diagnostics):

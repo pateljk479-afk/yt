@@ -11,15 +11,10 @@ from proxy_check import check_proxy
 from downloader import get_js_runtimes
 from storage import cleanup_stale_downloads
 from upload_tuning import configure_crypto_workers
+from logging_setup import configure_logging
 
 # Configure structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+configure_logging()
 logger = logging.getLogger("main")
 
 

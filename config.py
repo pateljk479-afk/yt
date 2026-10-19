@@ -38,6 +38,7 @@ UPLOAD_MAX_REQUESTS_PER_CONNECTION = max(UPLOAD_REQUESTS_PER_CONNECTION, min(8, 
     os.getenv("UPLOAD_MAX_REQUESTS_PER_CONNECTION", "8"))))
 CRYPTO_WORKERS = max(1, min(8, int(os.getenv("CRYPTO_WORKERS", "4"))))
 UPLOAD_TUNE_INTERVAL = max(5, float(os.getenv("UPLOAD_TUNE_INTERVAL", "5")))
+UPLOAD_RECOVERY_SECONDS = max(10, float(os.getenv("UPLOAD_RECOVERY_SECONDS", "30")))
 PYROGRAM_WAIT_TIMEOUT = int(os.getenv("PYROGRAM_WAIT_TIMEOUT", "60"))
 PREFETCH_PLAYLIST = os.getenv("PREFETCH_PLAYLIST", "false").lower() in ("true", "1", "yes")
 # Stream MP4 output directly into Telegram instead of storing input + merged copies.

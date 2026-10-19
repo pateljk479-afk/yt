@@ -14,6 +14,7 @@ downloads/
 *.session
 *.session-journal
 *.log
+*.log.*
 
 # Environment & credentials
 .env

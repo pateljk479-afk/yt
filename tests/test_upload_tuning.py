@@ -73,6 +73,52 @@ def test_fixed_mode_and_duplicate_limits():
     assert limited.capacity == 16 and limited.stopped
 
 
+def test_backoff_can_recover_original_capacity_in_same_video():
+    control = AdaptiveUploadWindow(8, 4, 16, 8, recovery_seconds=30)
+    control.observe(100, True, True, congested=True, now=0)
+    assert control.workers == 4
+    samples(control, 100, now=29)
+    assert control.workers == 4
+    samples(control, 100, now=31)
+    assert control.workers == 8
+    samples(control, 200, now=32)
+    assert control.workers == 16
+
+
+def test_plateau_is_retested_after_cooldown():
+    control = AdaptiveUploadWindow(8, 4, 16, 8, recovery_seconds=30)
+    samples(control, 100, now=0)
+    samples(control, 100, now=1)
+    assert control.workers == 8 and control.stopped
+    samples(control, 100, now=32)
+    assert control.workers == 16
+
+
+def test_repeated_throttles_have_a_floor_and_do_not_destroy_recovery_levels():
+    control = AdaptiveUploadWindow(8, 4, 16, 8, recovery_seconds=30)
+    for second in range(10):
+        control.observe(100, True, True, congested=True, now=second)
+    assert control.workers == 2
+    assert (8, 4) in control.levels and (16, 8) in control.levels
+
+
+def test_profile_reuse_is_scoped_to_client_dc_limits_and_ttl():
+    from upload_tuning import previous_upload_setting, remember_upload_setting
+    client = SimpleNamespace()
+    control = AdaptiveUploadWindow(8, 4, 16, 8)
+    samples(control, 100)
+    samples(control, 200)
+    remember_upload_setting(client, 2, False, control, 32 * 1024 * 1024)
+    assert previous_upload_setting(client, 2, False, 8, 4, 16, 8) == (16, 4)
+    assert previous_upload_setting(client, 3, False, 8, 4, 16, 8) is None
+    assert previous_upload_setting(client, 2, True, 8, 4, 16, 8) is None
+    assert previous_upload_setting(client, 2, False, 8, 4, 8, 8) is None
+    with patch.object(upload_tuning.time, "monotonic", return_value=client._bot_upload_profile.saved_at + 1801):
+        assert previous_upload_setting(client, 2, False, 8, 4, 16, 8) is None
+    remember_upload_setting(client, 2, False, control, 32 * 1024 * 1024, throttled=True)
+    assert client._bot_upload_profile is None
+
+
 def test_crypto_pool_is_configured_before_clients_start_and_is_idempotent(monkeypatch):
     monkeypatch.setattr(config, "CRYPTO_WORKERS", 4)
     previous = SimpleNamespace(shutdown=Mock())

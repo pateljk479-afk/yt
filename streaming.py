@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import time
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ import config
 from downloader import extract_info, sanitize_filename
 from uploader import human_readable_size, human_readable_time
 from direct_download import DirectRangeRelay, media_headers
-from upload_tuning import AdaptiveUploadWindow
+from upload_tuning import AdaptiveUploadWindow, previous_upload_setting, remember_upload_setting
 
 logger = logging.getLogger(__name__)
 PART_SIZE = 512 * 1024
@@ -60,6 +61,9 @@ class TransferStats:
     active_connections: int = 0
     request_capacity: int = 0
     retry_events: int = 0
+    throttle_events: int = 0
+    transfer_id: str = ""
+    wait_stage: str = "starting"
 
     @property
     def seconds(self):
@@ -133,7 +137,7 @@ def ffmpeg_command(plan, input_urls=None):
     return cmd
 
 
-async def _invoke_part(session, rpc, on_retry=None):
+async def _invoke_part(session, rpc, on_retry=None, transfer_id="-"):
     for attempt in range(5):
         try:
             # Surface throttling/retries to our controller instead of hiding
@@ -144,17 +148,18 @@ async def _invoke_part(session, rpc, on_retry=None):
             return
         except FloodWait as exc:
             if on_retry:
-                on_retry()
+                on_retry("throttle", exc.value)
             if attempt == 4:
                 raise
-            logger.warning("Telegram chunk %d waiting %ds (FloodWait)", rpc.file_part, exc.value)
+            logger.warning("Transfer %s Telegram chunk %d waiting %ds (FloodWait)", transfer_id, rpc.file_part, exc.value)
             await asyncio.sleep(exc.value)
         except (OSError, asyncio.TimeoutError, InternalServerError) as exc:
             if on_retry:
-                on_retry()
+                on_retry("network", 0)
             if attempt == 4:
                 raise
-            logger.warning("Telegram chunk %d retry %d/5 after %s", rpc.file_part, attempt + 1, type(exc).__name__)
+            logger.warning("Transfer %s Telegram chunk %d retry %d/5 after %s",
+                           transfer_id, rpc.file_part, attempt + 1, type(exc).__name__)
             await asyncio.sleep(0.5 * (attempt + 1))
 
 
@@ -166,11 +171,13 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
     monopolize the upload window. Progress messages run outside the data path.
     """
     stats = stats or TransferStats()
+    stats.transfer_id = stats.transfer_id or secrets.token_hex(4)
     workers = max(1, min(config.UPLOAD_WORKERS, 16))
     depth = config.UPLOAD_REQUESTS_PER_CONNECTION
     pool_size = max(workers, min(config.UPLOAD_MAX_WORKERS, 16)) if config.UPLOAD_ADAPTIVE else workers
     control = AdaptiveUploadWindow(workers, depth, pool_size,
-                                   config.UPLOAD_MAX_REQUESTS_PER_CONNECTION, config.UPLOAD_ADAPTIVE)
+                                   config.UPLOAD_MAX_REQUESTS_PER_CONNECTION, config.UPLOAD_ADAPTIVE,
+                                   recovery_seconds=config.UPLOAD_RECOVERY_SECONDS)
     stats.active_connections, stats.request_capacity = control.workers, control.capacity
     queue = asyncio.Queue(max(1, config.STREAM_BUFFER_BYTES // PART_SIZE))
     sessions = []
@@ -179,11 +186,25 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
     producer = reporter = tuner = None
     peak_pending = 0
     total = part = 0
+    pause_until = 0
     file_id = client.rnd_id()
     limit = min(config.MAX_FILE_SIZE, 2000 * 1024 * 1024)
     dc_id = await client.storage.dc_id()
     auth_key = await client.storage.auth_key()
     test_mode = await client.storage.test_mode()
+    if config.UPLOAD_ADAPTIVE:
+        warm = previous_upload_setting(client, dc_id, test_mode, workers, depth, pool_size,
+                                       config.UPLOAD_MAX_REQUESTS_PER_CONNECTION)
+        if warm:
+            control = AdaptiveUploadWindow(workers, depth, pool_size,
+                                           config.UPLOAD_MAX_REQUESTS_PER_CONNECTION, True,
+                                           recovery_seconds=config.UPLOAD_RECOVERY_SECONDS, start=warm)
+            stats.active_connections, stats.request_capacity = control.workers, control.capacity
+            logger.info("Transfer %s reusing confirmed upload setting: %d connections x %d requests",
+                        stats.transfer_id, *warm)
+    logger.info("Transfer %s starting: DC=%d, pool=%d, active=%d x %d, buffer=%d MiB, estimate=%d bytes",
+                stats.transfer_id, dc_id, pool_size, control.workers, control.depth,
+                config.STREAM_BUFFER_BYTES // (1024 * 1024), estimated_size)
 
     async def produce():
         while True:
@@ -197,12 +218,16 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                 raise TimeoutError("Direct video stream stalled; retry the video.") from exc
             stats.source_wait += time.monotonic() - started
             stats.source_bytes += len(chunk)
+            if stats.source_bytes == len(chunk):
+                logger.info("Transfer %s first source bytes after %.2fs", stats.transfer_id,
+                            time.monotonic() - stats.ready_at)
             if stats.source_bytes > limit:
                 raise ValueError("Stream exceeds the Telegram file size limit; choose a lower quality.")
             await queue.put((chunk, eof))
             stats.buffered_bytes = queue.qsize() * PART_SIZE
             stats.peak_buffered_bytes = max(stats.peak_buffered_bytes, stats.buffered_bytes)
             if eof:
+                logger.info("Transfer %s source EOF: %d bytes produced", stats.transfer_id, stats.source_bytes)
                 return
 
     async def report():
@@ -215,9 +240,13 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
             stats.upload_bps = (stats.uploaded_bytes - previous_upload) / elapsed
             stats.sampled_at = now
             previous_time, previous_source, previous_upload = now, stats.source_bytes, stats.uploaded_bytes
-            logger.info("Transfer feed %.1f KiB/s -> Telegram %.1f KiB/s; buffered %.1f MiB; in-flight %d/%d",
-                        stats.source_bps / 1024, stats.upload_bps / 1024,
-                        stats.buffered_bytes / (1024 * 1024), stats.in_flight, control.capacity)
+            stats.wait_stage = "Telegram" if stats.buffered_bytes or stats.in_flight >= control.capacity else "source"
+            logger.info("Transfer %s feed=%.1f KiB/s Telegram=%.1f KiB/s; produced=%d acked=%d; "
+                        "buffer=%.1f MiB; active=%d; in-flight=%d/%d; retries=%d throttles=%d; waiting=%s",
+                        stats.transfer_id, stats.source_bps / 1024, stats.upload_bps / 1024,
+                        stats.source_bytes, stats.uploaded_bytes, stats.buffered_bytes / (1024 * 1024),
+                        control.workers, stats.in_flight, control.capacity,
+                        stats.retry_events, stats.throttle_events, stats.wait_stage)
             if progress:
                 try:
                     await asyncio.wait_for(progress(
@@ -226,8 +255,13 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                 except Exception:
                     logger.debug("Transfer progress update unavailable")
 
-    def retried():
+    def retried(kind, delay):
+        nonlocal pause_until
         stats.retry_events += 1
+        if kind == "throttle":
+            stats.throttle_events += 1
+            client._bot_upload_profile = None
+            pause_until = max(pause_until, time.monotonic() + delay)
 
     async def tune():
         nonlocal peak_pending
@@ -238,16 +272,17 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
             rate = (stats.uploaded_bytes - previous_bytes) / max(0.001, now - previous_time)
             changed = control.observe(rate, backlog=not queue.empty(),
                                       saturated=peak_pending >= control.capacity * 0.8,
-                                      congested=stats.retry_events > previous_retries)
-            previous_time, previous_bytes, previous_retries = now, stats.uploaded_bytes, stats.retry_events
+                                      congested=stats.throttle_events > previous_retries)
+            previous_time, previous_bytes, previous_retries = now, stats.uploaded_bytes, stats.throttle_events
             peak_pending = len(pending)
             stats.active_connections, stats.request_capacity = control.workers, control.capacity
             if changed:
-                logger.info("Upload tuning: %d active connections x %d requests (%s); %.1f KiB/s",
-                            control.workers, control.depth, control.reason, rate / 1024)
+                logger.info("Transfer %s upload tuning: %d connections x %d requests (%s); %.1f KiB/s; "
+                            "resume-in=%.1fs", stats.transfer_id, control.workers, control.depth, control.reason,
+                            rate / 1024, max(0, control.resume_at - now))
 
     async def send(index, rpc):
-        await _invoke_part(sessions[index], rpc, retried)
+        await _invoke_part(sessions[index], rpc, retried, stats.transfer_id)
         stats.uploaded_bytes += len(rpc.bytes)
 
     async def collect(done):
@@ -265,6 +300,7 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
         await collect(done)
 
     try:
+        setup_started = time.monotonic()
         for _ in range(pool_size):
             session = Session(client, dc_id, auth_key, test_mode, is_media=True)
             sessions.append(session)
@@ -272,6 +308,8 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
         for result in starts:
             if isinstance(result, BaseException):
                 raise result
+        logger.info("Transfer %s all %d media sessions ready in %.2fs", stats.transfer_id,
+                    len(sessions), time.monotonic() - setup_started)
         stats.ready_at = time.monotonic()
         producer = asyncio.create_task(produce())
         reporter = asyncio.create_task(report())
@@ -310,23 +348,31 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                 # Telegram requires a final empty part on exact chunk boundaries.
                 await _invoke_part(sessions[0], raw.functions.upload.SaveBigFilePart(
                     file_id=file_id, file_part=part,
-                    file_total_parts=math.ceil(total / PART_SIZE), bytes=chunk))
+                    file_total_parts=math.ceil(total / PART_SIZE), bytes=chunk), retried, stats.transfer_id)
                 stats.uploaded_bytes += len(chunk)
                 stats.finished_at = time.monotonic()
-                logger.info("Telegram upload complete: %.2f MiB/s, %d connections, %d requests/connection, %.1f MiB peak buffer",
-                            total / stats.seconds / (1024 * 1024), control.workers, control.depth,
-                            stats.peak_buffered_bytes / (1024 * 1024))
+                remember_upload_setting(client, dc_id, test_mode, control, total, stats.throttle_events > 0)
+                logger.info("Transfer %s Telegram upload complete: %.2f MiB/s, %d connections, "
+                            "%d requests/connection, %.1f MiB peak buffer; retries=%d throttles=%d",
+                            stats.transfer_id, total / stats.seconds / (1024 * 1024), control.workers, control.depth,
+                            stats.peak_buffered_bytes / (1024 * 1024), stats.retry_events, stats.throttle_events)
                 return raw.types.InputFileBig(id=file_id, parts=math.ceil(total / PART_SIZE), name=filename), total
             rpc = raw.functions.upload.SaveBigFilePart(
                 file_id=file_id, file_part=part, file_total_parts=-1, bytes=chunk)
             while len(pending) >= control.capacity:
                 await drain(one=True)
+            while pause_until > time.monotonic():
+                await asyncio.sleep(pause_until - time.monotonic())
             index = min(range(control.workers), key=lambda i: loads[i])
             loads[index] += 1
             pending[asyncio.create_task(send(index, rpc))] = index
             stats.in_flight = len(pending)
             peak_pending = max(peak_pending, len(pending))
             part += 1
+    except BaseException as exc:
+        logger.warning("Transfer %s interrupted: %s; produced=%d acked=%d in-flight=%d",
+                       stats.transfer_id, type(exc).__name__, stats.source_bytes, stats.uploaded_bytes, len(pending))
+        raise
     finally:
         tasks = list(pending) + [t for t in (producer, reporter, tuner) if t is not None]
         for task in tasks:
@@ -334,6 +380,7 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
         await asyncio.gather(*tasks, return_exceptions=True)
         stats.in_flight = stats.buffered_bytes = 0
         await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
+        logger.info("Transfer %s cleanup complete: %d sessions closed", stats.transfer_id, len(sessions))
 
 
 async def telegram_speed_probe(client, size=16 * 1024 * 1024):
@@ -396,6 +443,10 @@ async def _thumbnail(client, url):
 
 
 async def stream_video(client, chat_id, plan, progress=None, stats=None):
+    stats = stats or TransferStats()
+    stats.transfer_id = stats.transfer_id or secrets.token_hex(4)
+    logger.info("Transfer %s preparing MP4: height=%s; inputs=%d; estimated=%d bytes",
+                stats.transfer_id, plan.formats[0].get("height"), len(plan.formats), plan.estimated_size)
     async with DirectRangeRelay(plan) as relay:
         return await _stream_video(client, chat_id, plan, relay, progress, stats)
 
@@ -415,6 +466,8 @@ async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None)
         file, size = await upload_stream(client, process.stdout, filename, plan.estimated_size, progress, stats)
         code = await asyncio.wait_for(process.wait(), 30)
         diagnostics = await errors
+        logger.info("Transfer %s FFmpeg exited=%d; CDN bytes=%d; output=%d bytes",
+                    stats.transfer_id, code, relay.network_bytes, size)
         if relay.failure:
             raise relay.failure
         if code:
@@ -444,7 +497,9 @@ async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None)
         # Reuse random_id on a timeout so a retried send cannot post duplicates.
         for attempt in range(3):
             try:
-                return await client.invoke(request)
+                sent = await client.invoke(request)
+                logger.info("Transfer %s published to Telegram", stats.transfer_id)
+                return sent
             except FloodWait as exc:
                 if attempt == 2:
                     raise

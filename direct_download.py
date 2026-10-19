@@ -3,7 +3,9 @@ import asyncio
 import logging
 import re
 import secrets
+import time
 from collections import deque
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp import web
@@ -77,6 +79,8 @@ class DirectRangeRelay:
 
     async def _probe(self, index, fmt):
         headers = media_headers(self.plan.info, fmt)
+        logger.info("CDN input %d: host=%s format=%s; probing direct byte ranges",
+                    index, urlsplit(fmt["url"]).hostname, fmt.get("format_id", "unknown"))
         try:
             async with self.client.get(URL(fmt["url"], encoded=True),
                                        headers={**headers, "Range": "bytes=0-0"}) as response:
@@ -91,7 +95,9 @@ class DirectRangeRelay:
                     return None
                 byte = await response.content.readexactly(1)
                 self.network_bytes += len(byte)
-                return {"url": fmt["url"], "headers": headers, "size": int(match[1])}
+                logger.info("CDN input %d supports ranges; exact size=%d bytes", index, int(match[1]))
+                return {"url": fmt["url"], "headers": headers, "size": int(match[1]),
+                        "index": index, "received": 0, "last_log": time.monotonic()}
         except (aiohttp.ClientError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
             logger.info("Input %d range probe unavailable; keeping direct FFmpeg input", index)
             return None
@@ -99,6 +105,8 @@ class DirectRangeRelay:
     async def _fetch(self, route, start, end):
         expected = end - start + 1
         for attempt in range(3):
+            started = time.monotonic()
+            logger.debug("CDN input %d range=%d-%d attempt=%d", route["index"], start, end, attempt + 1)
             try:
                 async with self.client.get(URL(route["url"], encoded=True), headers={
                     **route["headers"], "Range": f"bytes={start}-{end}"}) as response:
@@ -115,8 +123,16 @@ class DirectRangeRelay:
                     if len(data) != expected:
                         raise OSError("Direct CDN range was incomplete")
                     self.network_bytes += len(data)
+                    route["received"] += len(data)
+                    elapsed = max(0.001, time.monotonic() - started)
+                    if time.monotonic() - route["last_log"] >= 5:
+                        logger.info("CDN input %d received=%d bytes; last range=%d bytes in %.2fs (%.1f KiB/s)",
+                                    route["index"], route["received"], len(data), elapsed, len(data) / elapsed / 1024)
+                        route["last_log"] = time.monotonic()
                     return data
-            except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+                logger.warning("CDN input %d range=%d-%d retry=%d/3 after %s",
+                               route["index"], start, end, attempt + 1, type(exc).__name__)
                 if attempt == 2:
                     raise RuntimeError("Direct CDN range download failed after retries") from None
                 await asyncio.sleep(0.25 * (attempt + 1))

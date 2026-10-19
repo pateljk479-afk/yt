@@ -563,7 +563,9 @@ async def speedtest_command(client: Client, message: Message):
                 "📊 <b>LIVE TRANSFER SPEED</b>\n\n"
                 f"📥 <b>Video feed:</b> {human_readable_size(int(source_rate))}/s\n"
                 f"📤 <b>Telegram delivery:</b> {human_readable_size(int(upload_rate))}/s\n"
-                f"💾 <b>Buffered:</b> {human_readable_size(stats.buffered_bytes)}\n\n"
+                f"💾 <b>Buffered:</b> {human_readable_size(stats.buffered_bytes)}\n"
+                f"⏳ <b>Waiting on:</b> {stats.wait_stage}\n"
+                f"⚡ <b>Upload connections:</b> {stats.active_connections}\n\n"
                 "<i>Showing the active transfer. Run /speedtest when it finishes for a full network test.</i>")
         else:
             await message.reply_text(

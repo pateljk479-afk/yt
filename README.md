@@ -202,9 +202,16 @@ connections and tests increasing active connections, then request depth up to
 `UPLOAD_MAX_REQUESTS_PER_CONNECTION=8` (128 chunks / 64 MiB maximum in flight).
 Only saturated transfers with queued bytes are expanded. Each setting is
 measured over two `UPLOAD_TUNE_INTERVAL=5` second samples. A trial must improve
-throughput by at least 10% to be kept; otherwise the previous setting is restored
-and probing stops for that transfer. Retries or FloodWait trigger backoff.
-Requests already in flight finish normally when the window shrinks.
+throughput by at least 10% to be kept; otherwise the previous setting is restored.
+Capacity checks resume after `UPLOAD_RECOVERY_SECONDS=30`, so an early slowdown
+cannot permanently lock a long video into a small window. Temporary connection
+errors retry their own chunk without reducing all upload connections. Real
+FloodWait pauses new requests for the required duration and reduces concurrency;
+recovery retains the original configured levels and a minimum of two connections
+(or one when configured with one). In-flight requests finish normally as the
+window shrinks. A confirmed setting from a large completed transfer is reused
+for the next file on the same client/DC, within configured limits, for up to
+30 minutes. Throttled settings are discarded, and no video bytes are cached.
 
 `CRYPTO_WORKERS=4` replaces Pyrogram's shared single-worker encryption pool
 before connecting the bot, allowing packet encryption/decryption to run on
@@ -250,6 +257,21 @@ and Telegram upload measure different paths; fast download bandwidth does
 not imply equal Telegram upload bandwidth. `/logs` includes feed speed,
 acknowledged Telegram delivery speed, queue usage, active requests and retries
 so a source bottleneck can be distinguished from a Telegram bottleneck.
+
+Runtime logs are explicitly attached to the hosting console even when the bot
+has already registered its in-memory `/logs` handler. Each video has a transfer
+ID. Startup/session timings, CDN range capability and speed, produced/ACKed
+bytes, buffer occupancy, request window, retries/FloodWait, recovery decisions,
+FFmpeg exit status, final delivery and cleanup are logged. A `waiting=source`
+or `waiting=Telegram` hint describes which side lacks capacity; it is not proof
+of a particular remote network failure. `/speedtest` during an active transfer
+also shows that hint and the active connection count.
+
+`LOG_LEVEL=INFO` is the default; `DEBUG` adds application range diagnostics
+without enabling Pyrogram wire dumps. `LOG_FILE=bot.log` keeps a rotating
+2 MiB file and two backups (about 6 MiB maximum); set it empty to disable file
+logging. Console and `/logs` remain active. CDN signed URLs, cookie values and
+proxy credentials are not included in the new transfer diagnostics.
 
 With `YOUTUBE_PROXY` configured, YouTube metadata uses the proxy, but video,
 audio and thumbnails ALWAYS use direct server connections. The streaming
