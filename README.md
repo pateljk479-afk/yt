@@ -124,8 +124,21 @@ python main.py
 | `/help` | `/help` | Detailed guide on downloading videos and playlists |
 | `/video` | `/video <url>` | Analyze video, show qualities under 2GB, and download |
 | `/playlist` | `/playlist <url>` | Open paginated 10-per-page selection interface |
+| `/queue` | `/queue` or `/queue 2` | Show active/waiting playlists, processed/sent/failed counts, current video, and cancel buttons |
+| `/cancelqueue` | `/cancelqueue <job-id>` | Cancel a waiting or running playlist in this chat |
 
 *Note: You can also simply paste any YouTube video or playlist link directly into the chat!*
+
+After selecting videos and quality, each playlist joins one FIFO queue. There is
+no configured limit on waiting playlists (available server memory is the practical
+limit). Only one playlist runs at a time; the next starts automatically after
+completion, failure, or cancellation cleanup. `/queuestatus` and `/playlistqueue`
+are aliases for `/queue`. Refresh the queue view to see updated progress. Queue
+views are paginated, and each chat sees/cancels only its own jobs. Cancelling an
+active job stops remaining items and requests transfer cancellation; an existing
+worker thread or prefetched item must finish cleanup before the next job starts.
+Already uploaded videos remain in Telegram. The queue is in memory and is cleared
+when the bot restarts; the bot drains the active job before a normal shutdown.
 
 ### User Flow Example (Single Video):
 1. User sends `/video https://www.youtube.com/watch?v=...`

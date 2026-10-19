@@ -4,12 +4,14 @@ import asyncio
 import logging
 import json
 import tempfile
+import threading
+from html import escape
 from typing import Optional, List
 
 import config
 from pyrogram import Client, filters
 from pyrogram.session import Session
-from pyrogram.types import Message, CallbackQuery
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, MessageNotModified
 
 # Optimize Pyrogram MTProto upload timeouts for cloud servers:
@@ -383,6 +385,7 @@ from downloader import (
 from streaming import (StreamPlan, TransferStats, UnsupportedStream,
                        prepare_stream, stream_video, telegram_speed_probe)
 from session_manager import session_manager, PlaylistSession, VideoSession
+from playlist_queue import playlist_queue, PlaylistJob
 from keyboards import (
     build_playlist_keyboard,
     build_playlist_quality_keyboard,
@@ -519,6 +522,8 @@ async def start_command(client: Client, message: Message):
         "📌 <b>Commands:</b>\n"
         "• <code>/video &lt;link&gt;</code> - Download a single video\n"
         "• <code>/playlist &lt;link&gt;</code> - Select & download from a playlist\n"
+        "• <code>/queue</code> - View playlist queue, progress and cancel buttons\n"
+        "• <code>/cancelqueue JOB_ID</code> - Cancel one queued or active playlist\n"
         "• <code>/speedtest</code> - Test server network download & upload speeds\n"
         "• <code>/logs</code> - View recent server logs directly on Telegram\n"
         "• <code>/help</code> - Detailed help and instructions\n\n"
@@ -543,6 +548,9 @@ async def help_command(client: Client, message: Message):
         "• Use <b>Next ➡️</b> and <b>⬅️ Prev</b> to browse pages.\n"
         "• Click <b>✅ Select All</b> to download the entire playlist at once.\n"
         "• Click <b>📥 Download Selected</b> to pick your desired resolution.\n\n"
+        "• Playlists run in arrival order after you select the quality.\n"
+        "• <code>/queue</code> shows progress, pages and individual Cancel buttons.\n"
+        "• <code>/cancelqueue JOB_ID</code> cancels an active or waiting playlist.\n\n"
         "<b>3. Diagnostics:</b>\n"
         "• <code>/speedtest</code> - Check server download & upload bandwidth\n"
         "• <code>/logs</code> - View recent server application logs"
@@ -748,6 +756,78 @@ async def playlist_command(client: Client, message: Message):
     url = parts[1].strip()
     logger.info("📩 Received /playlist command from chat_id=%s: %s", message.chat.id, url)
     await handle_playlist_request(client, message, url)
+
+
+def playlist_queue_view(chat_id, page=0):
+    jobs = playlist_queue.visible(chat_id)
+    per_page = 6
+    pages = max(1, (len(jobs) + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    lines = [f"📋 <b>Playlist queue</b> · {len(jobs)} active/waiting",
+             f"Page {page + 1}/{pages}", ""]
+    buttons = []
+    for index, job in enumerate(jobs[page * per_page:(page + 1) * per_page], page * per_page + 1):
+        percent = int(100 * job.completed / job.total) if job.total else 0
+        bar = "█" * (percent // 10) + "░" * (10 - percent // 10)
+        lines.extend([
+            f"<b>{index}. {escape(job.title[:100])}</b> · {job.state}",
+            f"<code>{job.id}</code> · {escape(job.quality)}",
+            f"{bar} {percent}% · {job.completed}/{job.total} processed",
+            f"✅ Sent {job.successful} · ❌ Failed {job.failed}",
+            f"{escape(job.stage)}" + (f" · #{job.current}: {escape(job.current_title[:100])}" if job.current else ""), "",
+        ])
+        buttons.append([InlineKeyboardButton(f"🛑 Cancel #{index}", callback_data=f"pq_cancel:{job.id}:{page}")])
+    if not jobs:
+        lines.append("No playlists waiting or running. Choose videos and quality with /playlist to add one.")
+    navigation = []
+    if page:
+        navigation.append(InlineKeyboardButton("◀ Previous", callback_data=f"pq_page:{page - 1}"))
+    navigation.append(InlineKeyboardButton("🔄 Refresh", callback_data=f"pq_page:{page}"))
+    if page + 1 < pages:
+        navigation.append(InlineKeyboardButton("Next ▶", callback_data=f"pq_page:{page + 1}"))
+    buttons.append(navigation)
+    lines.append("/cancelqueue JOB_ID cancels that playlist. Completed uploads stay in the chat.")
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+@app.on_message(filters.command(["queue", "queuestatus", "playlistqueue"]))
+async def playlist_queue_command(client: Client, message: Message):
+    parts = message.text.split()
+    page = max(0, int(parts[1]) - 1) if len(parts) > 1 and parts[1].isdigit() else 0
+    text, keyboard = playlist_queue_view(message.chat.id, page)
+    await message.reply_text(text, reply_markup=keyboard)
+
+
+@app.on_message(filters.command(["cancelqueue", "cancelplaylist"]))
+async def cancel_playlist_command(client: Client, message: Message):
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.reply_text("Use /queue and tap Cancel, or send <code>/cancelqueue JOB_ID</code>.")
+        return
+    job = playlist_queue.cancel(parts[1], message.chat.id)
+    if not job:
+        await message.reply_text("No active/waiting playlist with that ID in this chat. Use /queue.")
+        return
+    await message.reply_text(f"🛑 Playlist <code>{job.id}</code>: {job.state}. Use /queue for progress.")
+
+
+@app.on_callback_query(filters.regex(r"^pq_(page|cancel):"))
+async def callback_playlist_queue(client: Client, callback: CallbackQuery):
+    parts = callback.data.split(":")
+    page = 0
+    if parts[0] == "pq_cancel":
+        job = playlist_queue.cancel(parts[1], callback.message.chat.id)
+        await callback.answer(f"Playlist {job.state}" if job else "Playlist already finished or not found")
+        if len(parts) > 2 and parts[2].isdigit():
+            page = int(parts[2])
+    else:
+        page = int(parts[1]) if parts[1].isdigit() else 0
+        await callback.answer()
+    text, keyboard = playlist_queue_view(callback.message.chat.id, page)
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except MessageNotModified:
+        pass
 
 
 @app.on_message(filters.text & filters.private)
@@ -1069,25 +1149,44 @@ async def callback_pl_start_download(client: Client, callback: CallbackQuery):
         await callback.answer("⚠️ Session expired.", show_alert=True)
         return
 
+    if session.chat_id != callback.message.chat.id:
+        await callback.answer("This playlist belongs to another chat.", show_alert=True)
+        return
+
     selected_entries = session.get_selected_entries()
     if not selected_entries:
         await callback.answer("⚠️ No videos selected.", show_alert=True)
         return
 
-    await callback.answer("Download task started!")
-    # Remove session from memory once download begins
+    # Consume before the first await so repeated taps cannot enqueue twice.
     session_manager.remove_session(session_id)
-
     status_msg = callback.message
-    asyncio.create_task(
-        process_playlist_downloads(
-            client=client,
-            status_msg=status_msg,
-            chat_id=callback.message.chat.id,
-            entries=selected_entries,
-            quality_key=quality_key,
-        )
-    )
+    async def run(job):
+        try:
+            await process_playlist_downloads(client, status_msg, job.chat_id,
+                                             job.entries, quality_key, job=job)
+        except asyncio.CancelledError:
+            try:
+                await status_msg.edit_text(
+                    f"🛑 <b>Playlist cancelled</b> · <code>{job.id}</code>\n"
+                    f"Sent: {job.successful}/{job.total} · Failed: {job.failed}")
+            except Exception:
+                logger.debug("Cancelled playlist message unavailable", exc_info=True)
+            raise
+    job = PlaylistJob(callback.message.chat.id, session.playlist_title,
+                      selected_entries, quality_key, run)
+    # Acknowledge before starting the worker so the running progress is never
+    # overwritten with a late 'queued' edit.
+    await callback.answer("Playlist added to queue")
+    try:
+        await status_msg.edit_text(
+            f"📋 <b>Playlist queued:</b> {escape(job.title)}\n"
+            f"Job: <code>{job.id}</code> · Videos: {job.total}\n"
+            "Starts automatically after earlier playlists. Use /queue for progress.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🛑 Cancel playlist", callback_data=f"pq_cancel:{job.id}")]]))
+    finally:
+        playlist_queue.enqueue(job)
 
 
 @app.on_callback_query(filters.regex(r"^vid:(.+):(.+)"))
@@ -1124,23 +1223,34 @@ async def callback_vid_start_download(client: Client, callback: CallbackQuery):
 async def prepare_download(status_msg, url, quality_key, max_quality_height=None):
     """Prepare stream metadata or a disk download; drain workers on cancel."""
     updater = ThrottledProgressUpdater(status_msg, stage="Downloading 📥")
+    stopped = threading.Event()
+    def progress(data):
+        if stopped.is_set():
+            raise RuntimeError("Playlist download cancelled")
+        updater.sync_hook(data)
     try:
         async with download_semaphore:
             await status_msg.edit_text("⚡ <b>Starting high-speed download...</b>")
             def prepare():
                 if config.STREAM_VIDEO_UPLOADS and quality_key != "audio":
                     try:
-                        return prepare_stream(url, quality_key, updater.sync_hook, max_quality_height)
+                        return prepare_stream(url, quality_key, progress, max_quality_height)
                     except UnsupportedStream as exc:
                         logger.info("Using disk downloader for this source: %s", exc)
-                return download_media(url, quality_key, updater.sync_hook, max_quality_height)
+                return download_media(url, quality_key, progress, max_quality_height)
 
             worker = asyncio.create_task(asyncio.to_thread(prepare))
             try:
                 return await asyncio.shield(worker)
             except asyncio.CancelledError:
-                result = await worker
-                safe_cleanup(result.temp_dir)
+                stopped.set()
+                updater.active = False
+                try:
+                    result = await worker
+                    safe_cleanup(result.temp_dir)
+                except Exception:
+                    # download_media owns cleanup when its cancellation hook raises.
+                    logger.debug("Cancelled download worker stopped", exc_info=True)
                 raise
     finally:
         updater.active = False
@@ -1282,11 +1392,25 @@ async def process_playlist_downloads(
     chat_id: int,
     entries: List[dict],
     quality_key: str,
+    job: Optional[PlaylistJob] = None,
 ):
     """Process playlist downloads. Sequentially by default to prevent download and upload bandwidth contention."""
     total = len(entries)
     successful = 0
     failed = 0
+
+    def progress(index=None, stage=None):
+        if job is None:
+            return
+        job.successful = successful
+        job.failed = failed
+        if index is not None:
+            job.current = index
+            job.current_title = entries[index - 1].get("title", f"Video {index}")
+        if stage and job.state != "cancelling":
+            job.stage = stage
+        logger.info("Playlist progress job=%s item=%s/%s stage=%s sent=%s failed=%s",
+                    job.id, job.current, total, job.stage, successful, failed)
 
     if not entries:
         try:
@@ -1329,6 +1453,7 @@ async def process_playlist_downloads(
         pending = asyncio.create_task(prepare_item(1, entries[0])) if entries else None
         try:
             for offset in range(total):
+                progress(offset + 1, "Downloading / preparing media")
                 prepared = await asyncio.shield(pending)
                 pending = None
                 # Bound disk usage to the uploading file plus one prefetched file.
@@ -1336,8 +1461,10 @@ async def process_playlist_downloads(
                     pending = asyncio.create_task(prepare_item(offset + 2, entries[offset + 1]))
                 if prepared is None:
                     failed += 1
+                    progress()
                     continue
                 item_status, video_url, result = prepared
+                progress(stage="Verifying / uploading to Telegram")
                 try:
                     success = await process_single_download(
                         client, item_status, chat_id, video_url, quality_key,
@@ -1347,6 +1474,7 @@ async def process_playlist_downloads(
                     safe_cleanup(result.temp_dir)
                 successful += int(success)
                 failed += int(not success)
+                progress()
         finally:
             if pending is not None:
                 prepared = await pending
@@ -1355,6 +1483,7 @@ async def process_playlist_downloads(
     else:
         # Sequential pipeline: clean download followed by maximum speed upload
         for idx, entry in enumerate(entries, start=1):
+            progress(idx, "Downloading / preparing media")
             video_title = entry.get("title", f"Video {idx}")
             video_url = entry.get("url") or ""
             video_id = entry.get("id") or ""
@@ -1380,12 +1509,15 @@ async def process_playlist_downloads(
                     except Exception:
                         pass
                 failed += 1
+                progress()
                 continue
 
             if prepared is None:
                 failed += 1
+                progress()
                 continue
 
+            progress(stage="Verifying / uploading to Telegram")
             try:
                 success = await process_single_download(
                     client, item_status, chat_id, video_url, quality_key,
@@ -1395,7 +1527,9 @@ async def process_playlist_downloads(
                 safe_cleanup(prepared.temp_dir)
             successful += int(success)
             failed += int(not success)
+            progress()
 
+    progress(stage="Completed")
     summary_text = (
         f"🎉 <b>Playlist Download Completed!</b>\n\n"
         f"✅ <b>Successfully sent:</b> {successful} / {total}\n"

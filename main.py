@@ -6,6 +6,7 @@ from pyrogram import idle
 
 import config
 from bot import app
+from playlist_queue import playlist_queue
 from web import start_web_server
 from proxy_check import check_proxy
 from downloader import get_js_runtimes
@@ -118,6 +119,7 @@ async def main():
     finally:
         heartbeat_task.cancel()
         logger.info("Shutting down service...")
+        await playlist_queue.close()
         await app.stop()
         if web_runner:
             await web_runner.cleanup()
