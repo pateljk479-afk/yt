@@ -49,6 +49,7 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 ├── bot.py                  # Pyrogram bot client, commands, and callback query handlers
 ├── downloader.py           # yt-dlp integration, 2GB filtering, size estimation & downloads
 ├── streaming.py            # Direct FFmpeg muxing and bounded Telegram streamed uploads
+├── direct_download.py      # Parallel CDN ranges through a seekable loopback input
 ├── keyboards.py            # Telegram inline keyboards (quality selection & playlist pagination)
 ├── session_manager.py      # In-memory session state for playlist pagination & selections
 ├── uploader.py             # Progress formatting, JPEG thumbnail conversion & MP4 validation
@@ -186,9 +187,20 @@ reserving another 1.5 GB for merging. This uses Telegram's documented
 [streamed-upload protocol](https://core.telegram.org/api/files#streamed-uploads),
 including unknown part counts until EOF; Telegram assembles one final video.
 
-Uploads retain at most twice `UPLOAD_WORKERS` chunks of 512 KiB (4 MiB with
-the default 4 workers), plus subprocess, network and FFmpeg buffers. A slower
-Telegram connection pauses reading, which also pauses FFmpeg and the CDN input.
+The direct downloader requests small HTTP ranges in parallel (4 connections
+and 1 MiB ranges per input by default), preserving byte order and supporting
+FFmpeg seeks. This avoids depending on one unbounded CDN request. A loopback
+HTTP input connects FFmpeg to these reads; CDN traffic itself is always direct.
+Range responses and byte counts are validated before forwarding. Sources that
+ignore Range stay on direct FFmpeg input. No paid proxy fallback is used.
+
+`STREAM_BUFFER_MB=32` lets FFmpeg run ahead of Telegram within a fixed memory
+budget. Uploads pipeline `UPLOAD_REQUESTS_PER_CONNECTION=4` requests per
+`UPLOAD_WORKERS=4` connections (16 chunks / 8 MiB in flight by default).
+Free connection slots take the next chunk; slow connections do not hold up
+healthy ones. Sessions start concurrently, and status edits run outside the
+data path. These buffers plus CDN ranges and subprocess/network/FFmpeg buffers
+use RAM, not disk. Once the buffer fills, backpressure pauses downloading.
 Chunks retry up to five times while their bytes remain in memory. Failed chunks,
 source timeouts and cancellation stop the transfer and close the upload sessions.
 Incomplete or failed FFmpeg output is never published to the chat. Actual byte
@@ -197,6 +209,11 @@ Transfer speed depends on CDN and Telegram throughput as well as server bandwidt
 
 FFmpeg must be installed and on PATH. `STREAM_READ_TIMEOUT=90` bounds a stalled
 source; `UPLOAD_WORKERS=4` controls upload parallelism (clamped to 1–16).
+`STREAM_PARALLEL_DOWNLOADS=false` disables parallel ranges for troubleshooting;
+`STREAM_DOWNLOAD_WORKERS` (1–8) and `STREAM_DOWNLOAD_CHUNK_KB` (256–4096) tune
+CDN reads. `STREAM_BUFFER_MB` is clamped to 1–64 and
+`UPLOAD_REQUESTS_PER_CONNECTION` to 1–8. Larger values consume more memory
+and cannot overcome an upstream CDN or Telegram route bandwidth limit.
 Set `STREAM_VIDEO_UPLOADS=false` to use the regular disk path.
 Audio conversion and sources without complete HTTP MP4/M4A resources (such as
 manifest-only formats) also use that path. Its temporary storage is bounded by
@@ -204,6 +221,15 @@ manifest-only formats) also use that path. Its temporary storage is bounded by
 It still needs room for the downloaded inputs and merged/converted output.
 Failed folders are removed immediately; startup removes only abandoned `yt_dl_*`
 folders inside `DOWNLOAD_DIR`, not cookies, sessions or other server files.
+
+`/speedtest` now uploads a 16 MiB memory probe through the same parallel
+Telegram uploader used for videos, excluding connection startup/shutdown.
+While a transfer runs, it shows live feed/delivery rates and queued bytes
+instead of starting competing network probes. Cloudflare download/upload
+and Telegram upload measure different paths; fast download bandwidth does
+not imply equal Telegram upload bandwidth. `/logs` includes feed speed,
+acknowledged Telegram delivery speed, queue usage, active requests and retries
+so a source bottleneck can be distinguished from a Telegram bottleneck.
 
 With `YOUTUBE_PROXY` configured, YouTube metadata uses the proxy, but video,
 audio and thumbnails ALWAYS use direct server connections. The streaming

@@ -156,6 +156,8 @@ async def test_speedtest_command_execution():
             pass
         async def read(self):
             return self._data
+        def raise_for_status(self):
+            pass
 
     class MockSession:
         async def __aenter__(self):
@@ -167,8 +169,10 @@ async def test_speedtest_command_execution():
         def post(self, *args, **kwargs):
             return MockResp(b"ok")
 
-    with patch("aiohttp.ClientSession", return_value=MockSession()):
+    with patch("aiohttp.ClientSession", return_value=MockSession()), \
+         patch("bot.telegram_speed_probe", new=AsyncMock(return_value=1024 * 1024)) as probe:
         await speedtest_command(MagicMock(), mock_msg)
+    probe.assert_awaited_once()
 
     assert status_msg.edit_text.call_count >= 1
     last_text = status_msg.edit_text.call_args[0][0]
@@ -177,3 +181,33 @@ async def test_speedtest_command_execution():
     assert "Upload:" in last_text
     assert "MB/s" in last_text
     assert "Mbps" in last_text
+    assert "Telegram Parallel Upload:" in last_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sampled", [False, True])
+async def test_speedtest_shows_live_transfer_without_competing_network_probes(sampled):
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import bot
+    from streaming import TransferStats
+
+    message = MagicMock()
+    message.reply_text = AsyncMock()
+    stats = TransferStats(ready_at=time.monotonic() - 10, uploaded_bytes=2 * 1024 * 1024,
+                          source_bytes=10 * 1024 * 1024, buffered_bytes=8 * 1024 * 1024,
+                          sampled_at=time.monotonic() if sampled else 0)
+    semaphore = asyncio.Semaphore(1)
+    await semaphore.acquire()
+    with patch.object(bot, "upload_semaphore", semaphore), \
+         patch.object(bot, "active_transfer_stats", stats), \
+         patch("aiohttp.ClientSession") as network, \
+         patch.object(bot, "telegram_speed_probe", new=AsyncMock()) as probe:
+        await bot.speedtest_command(MagicMock(), message)
+    text = message.reply_text.call_args.args[0]
+    assert "LIVE TRANSFER SPEED" in text and "Telegram delivery" in text
+    if sampled:
+        assert "0 B/s" in text  # A real stall must not be replaced by a lifetime average.
+    network.assert_not_called()
+    probe.assert_not_awaited()

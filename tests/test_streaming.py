@@ -157,6 +157,7 @@ async def test_failed_chunk_interrupts_stalled_source(monkeypatch):
 @pytest.mark.asyncio
 async def test_slow_telegram_bounds_prefetch_and_cancellation_cleans_sessions(monkeypatch):
     monkeypatch.setattr(config, "UPLOAD_WORKERS", 2)
+    monkeypatch.setattr(config, "STREAM_BUFFER_BYTES", PART_SIZE * 4)
     release = asyncio.Event()
     stopped = AsyncMock()
 
@@ -175,12 +176,15 @@ async def test_slow_telegram_bounds_prefetch_and_cancellation_cleans_sessions(mo
             return media_bytes(size)
 
     task = asyncio.create_task(streaming.upload_stream(fake_client(), EndlessReader(), "test.mp4"))
-    for _ in range(50):
+    for _ in range(200):
         await asyncio.sleep(0)
-    assert reads == 4
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        # 4 queued chunks + 8 requests in flight + one producer read.
+        assert 8 <= reads <= 13
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
     assert stopped.await_count == 2
 
 
@@ -234,7 +238,7 @@ async def test_startup_failure_closes_sessions(monkeypatch):
         start=AsyncMock(side_effect=OSError("offline")), stop=stopped)))
     with pytest.raises(OSError, match="offline"):
         await streaming.upload_stream(fake_client(), asyncio.StreamReader(), "test.mp4")
-    stopped.assert_awaited_once()
+    assert stopped.await_count == config.UPLOAD_WORKERS
 
 
 @pytest.mark.asyncio
@@ -246,9 +250,86 @@ async def test_source_timeout_closes_sessions(monkeypatch, telegram):
 
 
 @pytest.mark.asyncio
+async def test_fast_connection_keeps_working_while_another_is_slow(monkeypatch):
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 2)
+    release, fast_completed = asyncio.Event(), asyncio.Event()
+    counts, loads, peaks = [0, 0], [0, 0], [0, 0]
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            self.index = len(sessions)
+            sessions.append(self)
+            self.start, self.stop = AsyncMock(), AsyncMock()
+
+        async def invoke(self, rpc):
+            i = self.index
+            loads[i] += 1
+            peaks[i] = max(peaks[i], loads[i])
+            try:
+                if i == 0:
+                    await release.wait()
+                else:
+                    await asyncio.sleep(0)
+                counts[i] += 1
+                if i == 1 and counts[i] >= 8:
+                    fast_completed.set()
+                return True
+            finally:
+                loads[i] -= 1
+
+    monkeypatch.setattr(streaming, "Session", FakeSession)
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(PART_SIZE * 12 + 7))
+    reader.feed_eof()
+    task = asyncio.create_task(streaming.upload_stream(fake_client(), reader, "test.mp4"))
+    try:
+        await asyncio.wait_for(fast_completed.wait(), 2)
+        assert counts[0] == 0 and counts[1] >= 8
+        assert all(1 <= peak <= 2 for peak in peaks)
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 2)
+
+
+@pytest.mark.asyncio
+async def test_progress_edits_never_block_upload(monkeypatch, telegram):
+    monkeypatch.setattr(config, "PROGRESS_UPDATE_INTERVAL", 0.001)
+    editing = asyncio.Event()
+
+    async def slow_progress(current, total):
+        editing.set()
+        await asyncio.Event().wait()
+
+    class Reader:
+        remaining = PART_SIZE * 10
+
+        async def readexactly(self, count):
+            await asyncio.sleep(0.002)
+            if not self.remaining:
+                raise asyncio.IncompleteReadError(b"", count)
+            self.remaining -= count
+            return media_bytes(count)
+
+    _, size = await asyncio.wait_for(streaming.upload_stream(
+        fake_client(), Reader(), "test.mp4", progress=slow_progress), 2)
+    assert editing.is_set() and size == PART_SIZE * 10
+
+
+@pytest.mark.asyncio
+async def test_speed_probe_uses_actual_parallel_pipeline(telegram):
+    rate = await streaming.telegram_speed_probe(fake_client(), size=PART_SIZE * 24)
+    assert rate > 0
+    assert sum(len(r.bytes) for r in telegram[0]) == PART_SIZE * 24
+    assert all(s.stop.await_count == 1 for s in telegram[1])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("returncode,diagnostics", [
     (1, b"failure"), (0, b"out_time_us=1000000\nprogress=end\n")])
 async def test_bad_or_truncated_ffmpeg_output_is_not_published(monkeypatch, telegram, returncode, diagnostics):
+    monkeypatch.setattr(config, "STREAM_PARALLEL_DOWNLOADS", False)
     stdout, stderr = asyncio.StreamReader(), asyncio.StreamReader()
     stdout.feed_data(media_bytes(2048))
     stdout.feed_eof()

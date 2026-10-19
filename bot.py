@@ -380,7 +380,8 @@ from downloader import (
     sanitize_filename,
     validate_youtube_cookie_file,
 )
-from streaming import StreamPlan, UnsupportedStream, prepare_stream, stream_video
+from streaming import (StreamPlan, TransferStats, UnsupportedStream,
+                       prepare_stream, stream_video, telegram_speed_probe)
 from session_manager import session_manager, PlaylistSession, VideoSession
 from keyboards import (
     build_playlist_keyboard,
@@ -402,6 +403,7 @@ logger = logging.getLogger(__name__)
 transfer_lock = asyncio.Lock()
 download_semaphore = asyncio.Semaphore(1)
 upload_semaphore = asyncio.Semaphore(1)
+active_transfer_stats = None
 
 # Initialize Pyrogram Bot Client
 # API_ID and API_HASH default to fallback placeholders so unit tests can import safely
@@ -551,6 +553,23 @@ async def help_command(client: Client, message: Message):
 @app.on_message(filters.command("speedtest"))
 async def speedtest_command(client: Client, message: Message):
     logger.info("📩 Received /speedtest command from chat_id=%s", message.chat.id)
+    if upload_semaphore.locked() or download_semaphore.locked():
+        stats = active_transfer_stats
+        if stats and stats.ready_at:
+            elapsed = stats.seconds
+            upload_rate = stats.upload_bps if stats.sampled_at else stats.uploaded_bytes / elapsed
+            source_rate = stats.source_bps if stats.sampled_at else stats.source_bytes / elapsed
+            await message.reply_text(
+                "📊 <b>LIVE TRANSFER SPEED</b>\n\n"
+                f"📥 <b>Video feed:</b> {human_readable_size(int(source_rate))}/s\n"
+                f"📤 <b>Telegram delivery:</b> {human_readable_size(int(upload_rate))}/s\n"
+                f"💾 <b>Buffered:</b> {human_readable_size(stats.buffered_bytes)}\n\n"
+                "<i>Showing the active transfer. Run /speedtest when it finishes for a full network test.</i>")
+        else:
+            await message.reply_text(
+                "📊 <i>A media transfer is running. Run /speedtest when it finishes "
+                "so the test can measure the available bandwidth.</i>")
+        return
     status = await message.reply_text("🌐 <b>Running server network speed test...</b>\n\n📡 <i>Measuring latency...</i>")
     try:
         import aiohttp
@@ -559,12 +578,13 @@ async def speedtest_command(client: Client, message: Message):
             "Referer": "https://speed.cloudflare.com/",
             "Origin": "https://speed.cloudflare.com",
         }
-        async with aiohttp.ClientSession(headers=headers) as session:
+        async with aiohttp.ClientSession(headers=headers, trust_env=False) as session:
             # 1. Latency test
             pings = []
             for _ in range(3):
                 t0 = time.time()
                 async with session.get("https://speed.cloudflare.com/__down?bytes=0", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    resp.raise_for_status()
                     await resp.read()
                 pings.append((time.time() - t0) * 1000)
             avg_ping = sum(pings) / len(pings)
@@ -577,6 +597,7 @@ async def speedtest_command(client: Client, message: Message):
             )
             t0 = time.time()
             async with session.get("https://speed.cloudflare.com/__down?bytes=10000000", timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                resp.raise_for_status()
                 data = await resp.read()
             down_sec = max(0.001, time.time() - t0)
             down_bytes = len(data)
@@ -593,38 +614,28 @@ async def speedtest_command(client: Client, message: Message):
             up_payload = b"0" * (10 * 1024 * 1024)
             t0 = time.time()
             async with session.post("https://speed.cloudflare.com/__up", data=up_payload, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                resp.raise_for_status()
                 await resp.read()
             up_sec = max(0.001, time.time() - t0)
             up_mbs = (len(up_payload) / (1024 * 1024)) / up_sec
             up_mbps = (len(up_payload) * 8) / (up_sec * 1_000_000)
 
-            # 4. Direct Telegram MTProto Upload test (2 MB probe directly to Telegram DC)
+            # 4. Same parallel uploader as actual videos, with a memory source.
             await status.edit_text(
                 f"🌐 <b>Running server network speed test...</b>\n\n"
                 f"📡 Latency: <code>{avg_ping:.0f} ms</code>\n"
                 f"📥 Download: <code>{down_mbs:.2f} MB/s • {down_mbps:.1f} Mbps</code>\n"
                 f"📤 Upload: <code>{up_mbs:.2f} MB/s • {up_mbps:.1f} Mbps</code>\n"
-                f"⚡ <i>Testing real Telegram MTProto upload speed (2 MB)...</i>"
+                f"⚡ <i>Testing parallel Telegram upload speed (16 MB)...</i>"
             )
             tg_mbs, tg_mbps = 0.0, 0.0
             try:
-                tg_t0 = time.time()
-                dc_id = await client.storage.dc_id()
-                auth_key = await client.storage.auth_key()
-                test_mode = await client.storage.test_mode()
-                tg_session = _sf_mod.Session(client, dc_id, auth_key, test_mode, is_media=True)
-                await tg_session.start()
-                tg_dummy_data = b"0" * (512 * 1024)
-                tg_fid = client.rnd_id()
-                for p in range(4):
-                    await tg_session.invoke(_sf_mod.raw.functions.upload.SaveBigFilePart(
-                        file_id=tg_fid, file_part=p, file_total_parts=4, bytes=tg_dummy_data
-                    ))
-                await tg_session.stop()
-                tg_sec = max(0.001, time.time() - tg_t0)
-                tg_bytes = 4 * 512 * 1024
-                tg_mbs = (tg_bytes / (1024 * 1024)) / tg_sec
-                tg_mbps = (tg_bytes * 8) / (tg_sec * 1_000_000)
+                # Reserve the transfer slot so a new video cannot compete with
+                # this measurement. Session setup is excluded by the probe.
+                async with upload_semaphore:
+                    tg_rate = await telegram_speed_probe(client)
+                tg_mbs = tg_rate / (1024 * 1024)
+                tg_mbps = tg_rate * 8 / 1_000_000
             except Exception as tg_err:
                 logger.warning("Telegram MTProto speed probe skipped/failed: %s", tg_err)
 
@@ -635,11 +646,12 @@ async def speedtest_command(client: Client, message: Message):
                 f"📤 <b>Internet Upload:</b> <code>{up_mbs:.2f} MB/s • {up_mbps:.1f} Mbps</code>\n"
             )
             if tg_mbs > 0:
-                result_text += f"⚡ <b>Telegram DC Upload:</b> <code>{tg_mbs:.2f} MB/s • {tg_mbps:.1f} Mbps</code>\n"
+                result_text += f"⚡ <b>Telegram Parallel Upload:</b> <code>{tg_mbs:.2f} MB/s • {tg_mbps:.1f} Mbps</code>\n"
             result_text += (
                 f"📡 <b>Network Latency:</b> <code>{avg_ping:.0f} ms</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"ℹ️ <i>Measured directly on server host (Cloudflare edge & Telegram MTProto DC).</i>"
+                f"ℹ️ <i>Cloudflare and Telegram measure different routes. "
+                f"Telegram uses the real parallel uploader; connection setup is excluded.</i>"
             )
             await status.edit_text(result_text)
     except Exception as e:
@@ -1142,6 +1154,7 @@ async def process_single_download(
     prepared_result: Optional[DownloadResult] = None,
 ) -> bool:
     """Execute download, MP4 container verification, thumbnail processing, and upload. Returns True on success, False on error."""
+    global active_transfer_stats
     # Uploads have their own slot, so a completed file doesn't block the next
     # download even on a server configured with one download worker.
     async with upload_semaphore:
@@ -1159,7 +1172,9 @@ async def process_single_download(
                     "📤 <i>Downloading and uploading your video together...</i>\n"
                     "The complete video will appear here when the transfer finishes.")
                 async with download_semaphore:
-                    await stream_video(client, chat_id, result, updater.async_upload_hook)
+                    active_transfer_stats = TransferStats()
+                    await stream_video(client, chat_id, result, updater.async_upload_hook,
+                                       stats=active_transfer_stats)
                 try:
                     await status_msg.delete()
                 except Exception:
@@ -1253,6 +1268,7 @@ async def process_single_download(
                 pass
             return False
         finally:
+            active_transfer_stats = None
             updater.active = False
             if temp_dir:
                 safe_cleanup(temp_dir)

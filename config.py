@@ -31,11 +31,16 @@ CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
 MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "1"))
 UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "4"))
+UPLOAD_REQUESTS_PER_CONNECTION = max(1, min(8, int(os.getenv("UPLOAD_REQUESTS_PER_CONNECTION", "4"))))
 PYROGRAM_WAIT_TIMEOUT = int(os.getenv("PYROGRAM_WAIT_TIMEOUT", "60"))
 PREFETCH_PLAYLIST = os.getenv("PREFETCH_PLAYLIST", "false").lower() in ("true", "1", "yes")
 # Stream MP4 output directly into Telegram instead of storing input + merged copies.
 STREAM_VIDEO_UPLOADS = os.getenv("STREAM_VIDEO_UPLOADS", "true").lower() in ("true", "1", "yes")
 STREAM_READ_TIMEOUT = max(30, int(os.getenv("STREAM_READ_TIMEOUT", "90")))
+STREAM_BUFFER_BYTES = max(1, min(64, int(os.getenv("STREAM_BUFFER_MB", "32")))) * 1024 * 1024
+STREAM_PARALLEL_DOWNLOADS = os.getenv("STREAM_PARALLEL_DOWNLOADS", "true").lower() in ("true", "1", "yes")
+STREAM_DOWNLOAD_WORKERS = int(os.getenv("STREAM_DOWNLOAD_WORKERS", "4"))
+STREAM_DOWNLOAD_CHUNK_BYTES = int(os.getenv("STREAM_DOWNLOAD_CHUNK_KB", "1024")) * 1024
 BUFFER_SIZE = int(os.getenv("BUFFER_SIZE", str(1024 * 1024)))  # 1 MB I/O buffer
 HTTP_CHUNK_SIZE = int(os.getenv("HTTP_CHUNK_SIZE", str(10 * 1024 * 1024)))  # 10 MB HTTP chunks
 COOKIES_FILE = os.getenv("COOKIES_FILE", os.path.abspath("cookies.txt") if os.path.exists("cookies.txt") else "")

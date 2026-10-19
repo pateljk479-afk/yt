@@ -41,6 +41,9 @@ async def main():
     logger.info("  - Telegram Max File Size: %d MB", config.MAX_FILE_SIZE // (1024 * 1024))
     logger.info("  - Video transfers: %s", "direct streaming (no media files on disk)"
                 if config.STREAM_VIDEO_UPLOADS else "download to disk before upload")
+    logger.info("  - Telegram upload pipeline: %d connections x %d requests; %d MiB stream buffer",
+                max(1, min(config.UPLOAD_WORKERS, 16)), config.UPLOAD_REQUESTS_PER_CONNECTION,
+                config.STREAM_BUFFER_BYTES // (1024 * 1024))
     logger.info("  - Max Concurrent Downloads: %d", config.MAX_CONCURRENT_DOWNLOADS)
     logger.info("  - Fragment Parallel Streams: %d", config.CONCURRENT_FRAGMENT_DOWNLOADS)
     logger.info("  - aria2c Accelerated Downloader: %s", "Enabled" if config.ARIA2C_AVAILABLE else "Disabled (yt-dlp native multithread)")
