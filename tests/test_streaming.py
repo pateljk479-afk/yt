@@ -446,7 +446,9 @@ async def test_consecutive_files_reuse_confirmed_fast_setting_without_leaking_se
     monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 1)
     monkeypatch.setattr(config, "UPLOAD_MAX_WORKERS", 2)
     monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 2)
-    monkeypatch.setattr(config, "UPLOAD_TUNE_INTERVAL", 0.03)
+    # Average enough ACKs per sample to avoid Windows timer granularity
+    # turning a two-connection speedup into a noisy single-interval plateau.
+    monkeypatch.setattr(config, "UPLOAD_TUNE_INTERVAL", 0.15)
     sessions = []
 
     class FakeSession:
@@ -627,6 +629,7 @@ async def test_real_split_parts_preserve_frames_audio_and_independent_playback(
     info["formats"][0]["ext"] = extension
     info["formats"][0]["vcodec"] = "vp9" if extension == "webm" else "avc1"
     plan = streaming.select_streams(info, "1080")
+    plan.output_quality = "best_1080p" if known_size else "1080p"
     if not known_size:
         plan.estimated_size = 0
     monkeypatch.setattr(config, "STREAM_PARALLEL_DOWNLOADS", known_size)
@@ -649,6 +652,8 @@ async def test_real_split_parts_preserve_frames_audio_and_independent_playback(
         data = b"".join(r.bytes for r in calls)
         assert len(data) <= config.VIDEO_PART_SIZE_BYTES
         assert message.media.attributes[1].file_name.endswith(f"_part_{index:02d}.mp4")
+        assert message.media.attributes[1].file_name.endswith(f"_{plan.output_quality}_part_{index:02d}.mp4")
+        assert plan.output_quality.replace("_", " · ") in message.message
         assert f"Part {index}" in message.message
         assert message.media.attributes[0].duration > 0
         output = tmp_path / f"part-{index}.mp4"

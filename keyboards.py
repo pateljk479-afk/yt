@@ -3,6 +3,34 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from session_manager import PlaylistSession, VideoSession
 from uploader import human_readable_size
+from resolution_options import video_choices, quality_name
+
+
+def build_resolution_mode_keyboard(kind, session_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎬 Single Resolution", callback_data=f"rq_mode:{kind}:{session_id}:single")],
+        [InlineKeyboardButton("☑️ Multiple Resolutions", callback_data=f"rq_mode:{kind}:{session_id}:multi")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"{'pl_cancel' if kind == 'pl' else 'vid_cancel'}:{session_id}")],
+    ])
+
+
+def build_multi_resolution_keyboard(kind, session):
+    choices = video_choices(session if kind == "vid" else None)
+    rows, row = [], []
+    for key in choices:
+        mark = "✅" if key in session.selected_qualities else "⬜"
+        row.append(InlineKeyboardButton(f"{mark} {quality_name(key)}",
+                                       callback_data=f"rq_tg:{kind}:{session.session_id}:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(f"📥 Start ({len(session.selected_qualities)} qualities)",
+                                      callback_data=f"rq_go:{kind}:{session.session_id}")])
+    rows.append([InlineKeyboardButton("🔙 Resolution Mode", callback_data=f"rq_back:{kind}:{session.session_id}"),
+                 InlineKeyboardButton("❌ Cancel", callback_data=f"{'pl_cancel' if kind == 'pl' else 'vid_cancel'}:{session.session_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_playlist_keyboard(session: PlaylistSession) -> InlineKeyboardMarkup:
@@ -97,6 +125,9 @@ def build_playlist_quality_keyboard(session_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🎵 Audio Only (MP3)", callback_data=f"pl_q:{session_id}:audio"),
         ],
         [
+            InlineKeyboardButton("🔙 Resolution Mode", callback_data=f"rq_back:pl:{session_id}"),
+        ],
+        [
             InlineKeyboardButton("🔙 Back to Selection", callback_data=f"pl_back:{session_id}"),
             InlineKeyboardButton("❌ Cancel", callback_data=f"pl_cancel:{session_id}"),
         ],
@@ -149,6 +180,7 @@ def build_video_quality_keyboard(session: VideoSession) -> InlineKeyboardMarkup:
     )
 
     # 4. Cancel button
+    keyboard.append([InlineKeyboardButton("🔙 Resolution Mode", callback_data=f"rq_back:vid:{session.session_id}")])
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"vid_cancel:{session.session_id}")])
 
     return InlineKeyboardMarkup(keyboard)

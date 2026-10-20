@@ -20,6 +20,8 @@ class PlaylistSession:
     per_page: int = 10
     message_id: Optional[int] = None
     created_at: float = field(default_factory=time.time)
+    resolution_mode: str = "single"
+    selected_qualities: Set[str] = field(default_factory=set)
 
     @property
     def total_entries(self) -> int:
@@ -69,6 +71,8 @@ class VideoSession:
     analysis: VideoQualityAnalysis
     message_id: Optional[int] = None
     created_at: float = field(default_factory=time.time)
+    resolution_mode: str = "single"
+    selected_qualities: Set[str] = field(default_factory=set)
 
 
 class SessionManager:

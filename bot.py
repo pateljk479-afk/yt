@@ -386,12 +386,16 @@ from streaming import (StreamPlan, TransferStats, UnsupportedStream,
                        prepare_stream, stream_video, stream_local_video, video_part_limit,
                        telegram_speed_probe)
 from video_parts import plan_parts
+from resolution_options import (ordered_qualities, quality_name, quality_summary,
+                                resolution_tag, stream_identity, video_choices)
 from session_manager import session_manager, PlaylistSession, VideoSession
 from playlist_queue import playlist_queue, PlaylistJob
 from keyboards import (
     build_playlist_keyboard,
     build_playlist_quality_keyboard,
     build_video_quality_keyboard,
+    build_resolution_mode_keyboard,
+    build_multi_resolution_keyboard,
 )
 from uploader import (
     format_progress_bar,
@@ -517,6 +521,7 @@ async def start_command(client: Client, message: Message):
         "⚡ <b>Features:</b>\n"
         "• Download single YouTube videos or entire playlists\n"
         "• Select the original quality, including large videos\n"
+        "• Choose one resolution or check several qualities\n"
         "• Large videos arrive as numbered, playable MP4 parts\n"
         "• Interactive 10-per-page playlist navigation & multi-selection\n"
         "• Original file names and original YouTube thumbnails\n"
@@ -541,7 +546,8 @@ async def help_command(client: Client, message: Message):
         "📖 <b>How to Use This Bot:</b>\n\n"
         "<b>1. Downloading a Single Video:</b>\n"
         "• Send <code>/video https://youtu.be/...</code>\n"
-        "• You will see available resolutions (4K, 2K, 1080p, 720p, etc.)\n"
+        "• Choose <b>Single Resolution</b> or <b>Multiple Resolutions</b>.\n"
+        "• In multiple mode, check qualities and press <b>Start</b>.\n"
         "• <i>Note:</i> Large videos are split into playable parts without reducing quality.\n"
         "• Click <b>⭐ Max Quality</b> for the highest available quality.\n\n"
         "<b>2. Downloading Playlists:</b>\n"
@@ -549,7 +555,8 @@ async def help_command(client: Client, message: Message):
         "• The bot displays 10 videos per page with clickable checkmarks.\n"
         "• Use <b>Next ➡️</b> and <b>⬅️ Prev</b> to browse pages.\n"
         "• Click <b>✅ Select All</b> to download the entire playlist at once.\n"
-        "• Click <b>📥 Download Selected</b> to pick your desired resolution.\n\n"
+        "• Click <b>📥 Download Selected</b>, then choose single or multiple resolutions.\n"
+        "• Multiple mode sends each video's Best version first, then selected lower heights.\n\n"
         "• Playlists run in arrival order after you select the quality.\n"
         "• <code>/queue</code> shows progress, pages and individual Cancel buttons.\n"
         "• <code>/cancelqueue JOB_ID</code> cancels an active or waiting playlist.\n\n"
@@ -776,6 +783,8 @@ def playlist_queue_view(chat_id, page=0):
             f"<code>{job.id}</code> · {escape(job.quality)}",
             f"{bar} {percent}% · {job.completed}/{job.total} processed",
             f"✅ Sent {job.successful} · ❌ Failed {job.failed}",
+            *([f"Versions: ✅ {job.successful_variants} · ❌ {job.failed_variants} · "
+               f"↪️ Duplicates {job.skipped_variants}"] if len(job.qualities) > 1 else []),
             f"{escape(job.stage)}" + (f" · #{job.current}: {escape(job.current_title[:100])}" if job.current else ""), "",
         ])
         buttons.append([InlineKeyboardButton(f"🛑 Cancel #{index}", callback_data=f"pq_cancel:{job.id}:{page}")])
@@ -954,6 +963,7 @@ async def handle_video_request(client: Client, message: Message, url: str):
             analysis=analysis,
             message_id=status_msg.id,
         )
+        session.resolution_mode = "choice"
 
         caption = (
             f"🎬 <b>{analysis.title}</b>\n\n"
@@ -963,9 +973,9 @@ async def handle_video_request(client: Client, message: Message, url: str):
         if analysis.max_quality:
             caption += f"⭐ <b>Highest Quality Available:</b> {analysis.max_quality.label}\n\n"
         caption += "📦 Large videos are split into playable parts; selected quality is preserved.\n"
-        caption += "Select your desired download quality below:"
+        caption += "Choose single resolution or multiple resolutions below:"
 
-        keyboard = build_video_quality_keyboard(session)
+        keyboard = build_resolution_mode_keyboard("vid", session.session_id)
         await status_msg.edit_text(caption, reply_markup=keyboard)
 
     except Exception as e:
@@ -1014,6 +1024,9 @@ async def callback_noop(client: Client, callback: CallbackQuery):
 @app.on_callback_query(filters.regex(r"^pl_cancel:(.+)"))
 async def callback_pl_cancel(client: Client, callback: CallbackQuery):
     session_id = callback.matches[0].group(1)
+    if not _resolution_session(callback, "pl", session_id):
+        await callback.answer("Session expired or belongs to another chat.", show_alert=True)
+        return
     session_manager.remove_session(session_id)
     await callback.message.edit_text("❌ <i>Playlist selection cancelled.</i>")
     await callback.answer("Cancelled")
@@ -1022,6 +1035,9 @@ async def callback_pl_cancel(client: Client, callback: CallbackQuery):
 @app.on_callback_query(filters.regex(r"^vid_cancel:(.+)"))
 async def callback_vid_cancel(client: Client, callback: CallbackQuery):
     session_id = callback.matches[0].group(1)
+    if not _resolution_session(callback, "vid", session_id):
+        await callback.answer("Session expired or belongs to another chat.", show_alert=True)
+        return
     session_manager.remove_session(session_id)
     await callback.message.edit_text("❌ <i>Video download cancelled.</i>")
     await callback.answer("Cancelled")
@@ -1108,19 +1124,23 @@ async def callback_pl_download_prompt(client: Client, callback: CallbackQuery):
     if not session:
         await callback.answer("⚠️ Session expired.", show_alert=True)
         return
+    if session.chat_id != callback.message.chat.id:
+        await callback.answer("This playlist belongs to another chat.", show_alert=True)
+        return
 
     count = len(session.selected_indices)
     if count == 0:
         await callback.answer("⚠️ Please select at least one video to download!", show_alert=True)
         return
+    session.resolution_mode = "choice"
 
     text = (
         f"📥 <b>Ready to download {count} video(s) from:</b>\n"
-        f"<i>{session.playlist_title}</i>\n\n"
-        f"Select download quality:\n"
+        f"<i>{escape(session.playlist_title)}</i>\n\n"
+        f"Choose single resolution or multiple resolutions:\n"
         f"<i>(Large videos are auto-split into playable MP4 parts; quality is preserved)</i>"
     )
-    keyboard = build_playlist_quality_keyboard(session_id)
+    keyboard = build_resolution_mode_keyboard("pl", session_id)
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
@@ -1139,11 +1159,106 @@ async def callback_pl_back(client: Client, callback: CallbackQuery):
     await callback.answer()
 
 
+def _resolution_session(callback, kind, session_id):
+    if kind not in ("pl", "vid"):
+        return None
+    getter = session_manager.get_playlist_session if kind == "pl" else session_manager.get_video_session
+    session = getter(session_id)
+    if (not session or session.chat_id != callback.message.chat.id
+            or time.time() - session.created_at > session_manager.ttl_seconds):
+        return None
+    return session
+
+
+def _multiple_resolution_text(session, kind):
+    selected = ordered_qualities(session.selected_qualities)
+    title = session.playlist_title if kind == "pl" else session.analysis.title
+    return (f"☑️ <b>Multiple resolutions:</b> {escape(title)}\n\n"
+            f"Selected: <b>{quality_summary(selected) or 'None'}</b>\n"
+            "Toggle the qualities below, then press Start.\n"
+            "For each video: Best first, then highest to lowest resolution.\n"
+            "Unavailable exact heights use the nearest available lower quality; "
+            "identical streams are sent once. Large versions are split into playable parts.")
+
+
+@app.on_callback_query(filters.regex(r"^rq_mode:(pl|vid):([^:]+):(single|multi)$"))
+async def callback_resolution_mode(client: Client, callback: CallbackQuery):
+    kind, session_id, mode = callback.matches[0].groups()
+    session = _resolution_session(callback, kind, session_id)
+    if not session:
+        await callback.answer("Session expired or belongs to another chat.", show_alert=True)
+        return
+    session.resolution_mode = mode
+    if mode == "multi":
+        keyboard = build_multi_resolution_keyboard(kind, session)
+        text = _multiple_resolution_text(session, kind)
+    else:
+        keyboard = build_playlist_quality_keyboard(session_id) if kind == "pl" else build_video_quality_keyboard(session)
+        text = "🎬 <b>Single resolution</b>\nChoose a quality. Large videos are auto-split without reducing quality."
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@app.on_callback_query(filters.regex(r"^rq_back:(pl|vid):([^:]+)$"))
+async def callback_resolution_back(client: Client, callback: CallbackQuery):
+    kind, session_id = callback.matches[0].groups()
+    session = _resolution_session(callback, kind, session_id)
+    if not session:
+        await callback.answer("Session expired or belongs to another chat.", show_alert=True)
+        return
+    session.resolution_mode = "choice"
+    await callback.message.edit_text("🎞️ Choose single resolution or multiple resolutions:",
+                                     reply_markup=build_resolution_mode_keyboard(kind, session_id))
+    await callback.answer()
+
+
+@app.on_callback_query(filters.regex(r"^rq_tg:(pl|vid):([^:]+):([^:]+)$"))
+async def callback_resolution_toggle(client: Client, callback: CallbackQuery):
+    kind, session_id, key = callback.matches[0].groups()
+    session = _resolution_session(callback, kind, session_id)
+    if not session:
+        await callback.answer("Session expired or belongs to another chat.", show_alert=True)
+        return
+    if session.resolution_mode != "multi" or key not in video_choices(session if kind == "vid" else None):
+        await callback.answer("Choose Multiple Resolutions and a listed quality.", show_alert=True)
+        return
+    if key in session.selected_qualities:
+        session.selected_qualities.remove(key)
+    else:
+        session.selected_qualities.add(key)
+    await callback.message.edit_text(_multiple_resolution_text(session, kind),
+                                     reply_markup=build_multi_resolution_keyboard(kind, session))
+    await callback.answer()
+
+
+@app.on_callback_query(filters.regex(r"^rq_go:(pl|vid):([^:]+)$"))
+async def callback_resolution_start(client: Client, callback: CallbackQuery):
+    kind, session_id = callback.matches[0].groups()
+    session = _resolution_session(callback, kind, session_id)
+    if not session:
+        await callback.answer("Session expired or belongs to another chat.", show_alert=True)
+        return
+    qualities = ordered_qualities(session.selected_qualities)
+    if session.resolution_mode != "multi" or not qualities:
+        await callback.answer("Select at least one quality first.", show_alert=True)
+        return
+    if kind == "pl":
+        if not session.get_selected_entries():
+            await callback.answer("Select at least one video first.", show_alert=True)
+            return
+        await _enqueue_playlist_selection(client, callback, session, qualities)
+    else:
+        session_manager.remove_session(session_id)
+        await callback.answer("Multiple-resolution download started")
+        asyncio.create_task(process_multiple_resolutions(
+            client, callback.message, session.chat_id, [{"url": session.video_url}], qualities))
+
+
 @app.on_callback_query(filters.regex(r"^pl_q:(.+):(.+)"))
 async def callback_pl_start_download(client: Client, callback: CallbackQuery):
     session_id = callback.matches[0].group(1)
     quality_key = callback.matches[0].group(2)
-    session = session_manager.get_playlist_session(session_id)
+    session = _resolution_session(callback, "pl", session_id)
     if not session:
         await callback.answer("⚠️ Session expired.", show_alert=True)
         return
@@ -1152,6 +1267,15 @@ async def callback_pl_start_download(client: Client, callback: CallbackQuery):
         await callback.answer("This playlist belongs to another chat.", show_alert=True)
         return
 
+    if session.resolution_mode != "single" or quality_key not in (*video_choices(), "audio"):
+        await callback.answer("Choose Single Resolution and a listed quality.", show_alert=True)
+        return
+
+    await _enqueue_playlist_selection(client, callback, session, quality_key)
+
+
+async def _enqueue_playlist_selection(client, callback, session, quality_key):
+    session_id = session.session_id
     selected_entries = session.get_selected_entries()
     if not selected_entries:
         await callback.answer("⚠️ No videos selected.", show_alert=True)
@@ -1168,12 +1292,16 @@ async def callback_pl_start_download(client: Client, callback: CallbackQuery):
             try:
                 await status_msg.edit_text(
                     f"🛑 <b>Playlist cancelled</b> · <code>{job.id}</code>\n"
-                    f"Sent: {job.successful}/{job.total} · Failed: {job.failed}")
+                    f"Sent: {job.successful}/{job.total} · Failed: {job.failed}" +
+                    (f"\nVersions delivered: {job.successful_variants} · Failed versions: {job.failed_variants}"
+                     if isinstance(quality_key, tuple) else ""))
             except Exception:
                 logger.debug("Cancelled playlist message unavailable", exc_info=True)
             raise
     job = PlaylistJob(callback.message.chat.id, session.playlist_title,
-                      selected_entries, quality_key, run)
+                      selected_entries,
+                      quality_summary(quality_key) if isinstance(quality_key, tuple) else quality_key,
+                      run, qualities=quality_key if isinstance(quality_key, tuple) else (quality_key,))
     # Acknowledge before starting the worker so the running progress is never
     # overwritten with a late 'queued' edit.
     await callback.answer("Playlist added to queue")
@@ -1181,6 +1309,7 @@ async def callback_pl_start_download(client: Client, callback: CallbackQuery):
         await status_msg.edit_text(
             f"📋 <b>Playlist queued:</b> {escape(job.title)}\n"
             f"Job: <code>{job.id}</code> · Videos: {job.total}\n"
+            f"Qualities: {escape(quality_summary(job.qualities))}\n"
             "Starts automatically after earlier playlists. Use /queue for progress.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🛑 Cancel playlist", callback_data=f"pq_cancel:{job.id}")]]))
@@ -1192,15 +1321,21 @@ async def callback_pl_start_download(client: Client, callback: CallbackQuery):
 async def callback_vid_start_download(client: Client, callback: CallbackQuery):
     session_id = callback.matches[0].group(1)
     quality_key = callback.matches[0].group(2)
-    session = session_manager.get_video_session(session_id)
+    session = _resolution_session(callback, "vid", session_id)
     if not session:
         await callback.answer("⚠️ Session expired.", show_alert=True)
         return
 
-    await callback.answer("Download started!")
+    if session.chat_id != callback.message.chat.id:
+        await callback.answer("This video belongs to another chat.", show_alert=True)
+        return
+    if session.resolution_mode != "single" or quality_key not in (*video_choices(session), "audio"):
+        await callback.answer("Choose Single Resolution and a listed quality.", show_alert=True)
+        return
     video_url = session.video_url
     max_h = session.analysis.max_quality.height if session.analysis.max_quality else 1080
     session_manager.remove_session(session_id)
+    await callback.answer("Download started!")
 
     status_msg = callback.message
     asyncio.create_task(
@@ -1219,7 +1354,7 @@ async def callback_vid_start_download(client: Client, callback: CallbackQuery):
 # DOWNLOAD & UPLOAD PIPELINE
 # =====================================================================
 
-async def prepare_download(status_msg, url, quality_key, max_quality_height=None):
+async def prepare_download(status_msg, url, quality_key, max_quality_height=None, metadata=None):
     """Prepare stream metadata or a disk download; drain workers on cancel."""
     updater = ThrottledProgressUpdater(status_msg, stage="Downloading 📥")
     stopped = threading.Event()
@@ -1233,6 +1368,9 @@ async def prepare_download(status_msg, url, quality_key, max_quality_height=None
             def prepare():
                 if config.STREAM_VIDEO_UPLOADS and quality_key != "audio":
                     try:
+                        if metadata is not None:
+                            from streaming import select_streams
+                            return select_streams(metadata, quality_key, max_quality_height)
                         return prepare_stream(url, quality_key, progress, max_quality_height)
                     except UnsupportedStream as exc:
                         logger.info("Using disk downloader for this source: %s", exc)
@@ -1263,6 +1401,7 @@ async def process_single_download(
     quality_key: str,
     max_quality_height: Optional[int] = None,
     prepared_result: Optional[DownloadResult] = None,
+    filename_quality: Optional[str] = None,
 ) -> bool:
     """Execute download, MP4 container verification, thumbnail processing, and upload. Returns True on success, False on error."""
     global active_transfer_stats
@@ -1276,6 +1415,9 @@ async def process_single_download(
             if result is None:
                 result = await prepare_download(status_msg, url, quality_key, max_quality_height)
             temp_dir = result.temp_dir
+            if filename_quality:
+                height = result.formats[0].get("height") if isinstance(result, StreamPlan) else result.height
+                result.output_quality = resolution_tag(filename_quality, height)
 
             if isinstance(result, StreamPlan) or (not result.is_audio and result.file_size > video_part_limit()):
                 updater.stage = "Transferring to Telegram 📤"
@@ -1332,6 +1474,9 @@ async def process_single_download(
 
             # Format file name preserving original YouTube title
             clean_filename = sanitize_filename(result.title) + (".mp3" if result.is_audio else ".mp4")
+            if filename_quality and not result.is_audio:
+                clean_filename = sanitize_filename(result.title) + "_" + result.output_quality + ".mp4"
+                caption += f"\n🎞️ <b>Quality:</b> {escape(result.output_quality.replace('_', ' · '))}"
 
             max_upload_retries = 3
             upload_success = False
@@ -1402,6 +1547,105 @@ async def process_single_download(
                 safe_cleanup(temp_dir)
 
 
+async def process_multiple_resolutions(client, status_msg, chat_id, entries, qualities, job=None):
+    """One video at a time, Best first; reuse source metadata, never stage variants."""
+    qualities = ordered_qualities(qualities)
+    if not qualities:
+        raise ValueError("Select at least one video resolution")
+    sent = failed = skipped = complete = incomplete = 0
+    for index, entry in enumerate(entries, 1):
+        title = entry.get("title", f"Video {index}")
+        url = entry.get("url") or entry.get("id") or ""
+        if not url.startswith("http"):
+            url = "https://www.youtube.com/watch?v=" + (entry.get("id") or url)
+        metadata = None
+        delivered = set()
+        item_failed = False
+        if job:
+            job.current, job.current_title = index, title
+        for key in qualities:
+            prepared = item_status = None
+            if job:
+                job.stage = f"Preparing / uploading {quality_name(key)}"
+            logger.info("Multiple-resolution transfer job=%s video=%d/%d quality=%s title=%s",
+                        job.id if job else "single", index, len(entries), key, title)
+            try:
+                item_status = await client.send_message(
+                    chat_id, f"📥 <b>[{index}/{len(entries)}] {escape(title)}</b>\n"
+                    f"Resolution: <b>{quality_name(key)}</b>")
+                if metadata is None:
+                    prepared = await prepare_download(item_status, url, key)
+                else:
+                    prepared = await prepare_download(item_status, url, key, metadata=metadata)
+                if isinstance(prepared, StreamPlan):
+                    metadata = prepared.info
+                    identity = stream_identity(prepared)
+                    actual_height = prepared.formats[0].get("height")
+                else:
+                    # Legacy disk-only sources have no reusable stream plan.
+                    actual_height = prepared.height
+                    identity = ("disk", actual_height, prepared.width)
+                if identity in delivered:
+                    skipped += 1
+                    actual_name = f"{actual_height}p" if actual_height else "source-quality"
+                    try:
+                        await item_status.edit_text(
+                            f"↪️ <b>{quality_name(key)} skipped:</b> the same {actual_name} "
+                            "version was already delivered for this video.")
+                    except Exception:
+                        logger.debug("Duplicate-version status unavailable")
+                    logger.info("Multiple-resolution duplicate skipped video=%d requested=%s actual=%s",
+                                index, key, actual_height)
+                    continue
+                if key != "max" and actual_height and int(key) != actual_height:
+                    logger.info("Resolution fallback video=%d requested=%sp actual=%sp; filename uses actual height",
+                                index, key, actual_height)
+                success = await process_single_download(
+                    client, item_status, chat_id, url, key, prepared_result=prepared, filename_quality=key)
+                if success:
+                    delivered.add(identity)
+                    sent += 1
+                else:
+                    failed += 1
+                    item_failed = True
+            except Exception as exc:
+                failed += 1
+                item_failed = True
+                logger.exception("Multiple-resolution variant failed video=%d quality=%s", index, key)
+                if item_status:
+                    try:
+                        await item_status.edit_text(
+                            f"❌ <b>{quality_name(key)} failed:</b> <code>{escape(str(exc)[:250])}</code>")
+                    except Exception:
+                        logger.debug("Variant error status unavailable")
+            finally:
+                if prepared is not None:
+                    safe_cleanup(prepared.temp_dir)
+                if job:
+                    job.successful_variants, job.failed_variants, job.skipped_variants = sent, failed, skipped
+                logger.info("Multiple-resolution progress job=%s video=%d quality=%s sent=%d failed=%d skipped=%d",
+                            job.id if job else "single", index, key, sent, failed, skipped)
+        if item_failed:
+            incomplete += 1
+        else:
+            complete += 1
+        if job:
+            job.successful, job.failed = complete, incomplete
+    if job:
+        job.stage = "Completed"
+    logger.info("Multiple-resolution transfer completed videos=%d complete=%d incomplete=%d sent=%d failed=%d duplicates=%d",
+                len(entries), complete, incomplete, sent, failed, skipped)
+    try:
+        await status_msg.edit_text(
+            f"🎉 <b>Multiple-resolution downloads completed</b>\n\n"
+            f"Qualities: {quality_summary(qualities)}\n"
+            f"✅ Videos completed: {complete} / {len(entries)}\n"
+            f"📤 Versions delivered: {sent}\n❌ Failed versions: {failed}\n"
+            f"↪️ Duplicate versions skipped: {skipped}")
+    except Exception:
+        logger.debug("Multiple-resolution final status unavailable")
+
+
 async def process_playlist_downloads(
     client: Client,
     status_msg: Message,
@@ -1411,6 +1655,8 @@ async def process_playlist_downloads(
     job: Optional[PlaylistJob] = None,
 ):
     """Process playlist downloads. Sequentially by default to prevent download and upload bandwidth contention."""
+    if isinstance(quality_key, (tuple, list)):
+        return await process_multiple_resolutions(client, status_msg, chat_id, entries, quality_key, job)
     total = len(entries)
     successful = 0
     failed = 0

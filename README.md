@@ -29,6 +29,8 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
      - `✅ Select All`: Selects every video in the playlist at once.
      - `⬜ Deselect All`: Clears selection.
    - `📥 Download Selected (N)`: Triggers quality selection and downloads only the chosen videos sequentially.
+   - Choose **Single Resolution** for the existing flow, or **Multiple Resolutions** to check several qualities and press Start.
+   - Multiple mode delivers Best, then selected heights from highest to lowest, for each video before moving to the next.
 
 4. **🎞️ Original Titles, Thumbnails & Streamable MP4 Container**
    - **Original Title**: Preserves the exact title from YouTube as the video file name (safely sanitized against filesystem illegal characters).
@@ -54,6 +56,7 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 ├── video_parts.py          # Bounded playable MP4 parts with keyframe cuts and rebased clocks
 ├── direct_download.py      # Parallel CDN ranges through a seekable loopback input
 ├── keyboards.py            # Telegram inline keyboards (quality selection & playlist pagination)
+├── resolution_options.py   # Ordered resolution choices, actual-height labels & stream identity
 ├── session_manager.py      # In-memory session state for playlist pagination & selections
 ├── uploader.py             # Progress formatting, JPEG thumbnail conversion & MP4 validation
 ├── web.py                  # Aiohttp HTTP health check server for Render hosting
@@ -149,7 +152,7 @@ when the bot restarts; the bot drains the active job before a normal shutdown.
 1. User sends `/video https://www.youtube.com/watch?v=...`
 2. Bot analyzes stream formats and size limits.
 3. Even if 4K is 7 GB, it remains the **⭐ Max Quality** option.
-4. User selects the desired resolution; size determines the number of attachments.
+4. User chooses Single Resolution and a quality, or Multiple Resolutions and several qualities.
 5. Bot streams the download with real-time speed & progress updates.
 6. Bot publishes the MP4 or numbered playable parts with title, thumbnail and source time range.
 
@@ -158,13 +161,62 @@ when the bot restarts; the bot drains the active job before a normal shutdown.
 2. Bot extracts playlist entries and displays Page 1 (10 videos with `⬜` checkmarks).
 3. User navigates with `Next ➡️` / `⬅️ Prev` or clicks `✅ Select All`.
 4. User clicks `📥 Download Selected (N)`.
-5. User selects desired quality.
+5. User chooses Single Resolution for one quality, or Multiple Resolutions, checks Best / 1080p / 720p / other heights, then presses Start.
 6. Bot downloads, merges and uploads each video together, preserving playlist order.
-   The completed video appears as one Telegram message after successful transfer.
+   Each version appears as a video or numbered playable parts.
    Optional `PREFETCH_PLAYLIST=true` prepares the next video's metadata; streamed
    media is only fetched when its transfer starts. For audio and manifest-only
    sources, prefetch downloads the next file to disk. Progress-bar edits are at
    least five seconds apart (`PROGRESS_UPDATE_INTERVAL`, minimum 5).
+
+### Multiple-resolution downloads
+
+The choice is available for single videos and after playlist video selection.
+Single Resolution retains the previous quality/audio buttons and filenames.
+Multiple Resolutions has checkboxes, a selected-count Start button, Back and
+Cancel. Best is first, followed by 2160p, 1440p, 1080p, 720p, 480p, 360p,
+240p and 144p. Single-video choices follow the existing format analysis; playlist
+choices are common target heights because individual videos may differ.
+
+For example, a 30-video playlist with Best, 1080p and 720p sends video 1's Best
+version (all parts), then its 1080p version (all parts), then its 720p version,
+before starting video 2. Qualities are fetched from the source, without encoding
+lower-resolution copies locally. Supported streaming variants reuse extracted
+metadata within the current video; the bot does not stage several full videos
+or raise simultaneous transfer limits. Multi mode processes variants sequentially
+even when `PREFETCH_PLAYLIST=true`.
+
+Multi-mode filenames label the actual result:
+
+```
+Spring Boot course_best_2160p.mp4
+Spring Boot course_1080p_part_01.mp4
+Spring Boot course_1080p_part_02.mp4
+Spring Boot course_720p.mp4
+```
+
+Captions show the same quality label. The part-size limit and keyframe-based
+splitter apply independently to each version. Actual available height is used
+in filenames, so a requested 1080p version that resolves to 720p is named 720p.
+Best is labeled `best_<actual-height>p`. A source is never lowered merely to
+fit the per-attachment size ceiling.
+
+If Best selects the same stream as 1080p, that stream is uploaded once, under
+its Best filename; the duplicate selection is reported as skipped. Likewise,
+different requested heights resolving to an already-delivered stream are
+skipped. Duplicate detection runs before upload; for streaming inputs it
+requires no duplicate media download. A failed version is not marked delivered,
+so another selected option resolving to that stream can still be attempted.
+Disk-only fallbacks identify duplicates after preparation and may require the
+additional disk download.
+
+The playlist remains one FIFO job. `/queue` shows its qualities, current version,
+video completion counts, delivered/failed versions and duplicate skips. A video
+is complete only when every selected version succeeded or was already delivered.
+A failed version does not prevent trying later qualities/videos. Cancellation
+stops further variants and drains current cleanup; already delivered media stays
+available. Repeated Start taps consume the session once and cannot enqueue a
+second job. The same in-memory session and queue restart limitations still apply.
 
 ---
 

@@ -27,9 +27,14 @@ class PlaylistJob:
     created_at: float = field(default_factory=time.time)
     task: asyncio.Task | None = field(default=None, repr=False)
     total: int = field(init=False)
+    qualities: tuple[str, ...] = ()
+    successful_variants: int = 0
+    failed_variants: int = 0
+    skipped_variants: int = 0
 
     def __post_init__(self):
         self.entries = [dict(entry) for entry in self.entries]
+        self.qualities = tuple(self.qualities)
         self.total = len(self.entries)
 
     @property
@@ -46,7 +51,8 @@ class PlaylistQueue:
 
     def enqueue(self, job: PlaylistJob):
         self.pending.append(job)
-        logger.info("Playlist queued job=%s chat=%s videos=%s", job.id, job.chat_id, job.total)
+        logger.info("Playlist queued job=%s chat=%s videos=%s qualities=%s", job.id, job.chat_id, job.total,
+                    job.qualities or (job.quality,))
         if self.worker is None or self.worker.done():
             self.worker = asyncio.create_task(self._run())
         return job

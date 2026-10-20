@@ -45,6 +45,7 @@ class StreamPlan:
     estimated_size: int
     # Matches the playlist's cleanup contract; streamed videos own no disk files.
     temp_dir: str = None
+    output_quality: str = ""
 
 
 @dataclass
@@ -471,7 +472,8 @@ async def stream_video(client, chat_id, plan, progress=None, stats=None):
 async def stream_local_video(client, chat_id, result, progress=None, stats=None):
     """Split a disk-fallback result through the same bounded MP4/MTProto path."""
     plan = StreamPlan({"title": result.title, "duration": result.duration},
-                      [{"width": result.width, "height": result.height}], result.file_size)
+                      [{"width": result.width, "height": result.height}], result.file_size,
+                      output_quality=getattr(result, "output_quality", ""))
     relay = SimpleNamespace(failure=None, network_bytes=0, urls=None)
     return await _stream_video(client, chat_id, plan, relay, progress, stats, local_path=result.file_path)
 
@@ -487,6 +489,8 @@ async def _publish_video_part(client, chat_id, plan, file, filename, size, durat
     thumb = await _thumbnail(client, info.get("thumbnail"))
     title = html.escape(str(info.get("title", "Video")))
     caption = f"🎬 <b>{title}</b>"
+    if plan.output_quality:
+        caption += f"\n🎞️ <b>Quality:</b> {html.escape(plan.output_quality.replace('_', ' · '))}"
     if index is not None:
         caption += (f"\n📦 <b>Part {index}</b> · Original quality\n"
                     f"🕒 {human_readable_time(int(start))} – {human_readable_time(math.ceil(start + duration))}")
@@ -534,6 +538,8 @@ async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None,
     stats = stats or TransferStats(transfer_id=secrets.token_hex(4))
     info = plan.info
     base = sanitize_filename(info.get("title", "video"))
+    if plan.output_quality:
+        base += "_" + plan.output_quality
     limit = video_part_limit()
     count, target = plan_parts(plan.estimated_size, limit)
     logger.info("Transfer %s split plan: estimate=%d bytes, estimated parts=%d, target=%d, "
