@@ -56,7 +56,8 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 ├── video_parts.py          # Bounded playable MP4 parts with keyframe cuts and rebased clocks
 ├── direct_download.py      # Parallel CDN ranges through a seekable loopback input
 ├── keyboards.py            # Telegram inline keyboards (quality selection & playlist pagination)
-├── resolution_options.py   # Ordered resolution choices, actual-height labels & stream identity
+├── resolution_options.py   # Resolution tiers, readable labels & stream identity
+├── chat_ui.py              # Video reply collections, captions & five-minute notice cleanup
 ├── session_manager.py      # In-memory session state for playlist pagination & selections
 ├── uploader.py             # Progress formatting, JPEG thumbnail conversion & MP4 validation
 ├── web.py                  # Aiohttp HTTP health check server for Render hosting
@@ -172,7 +173,7 @@ when the bot restarts; the bot drains the active job before a normal shutdown.
 ### Multiple-resolution downloads
 
 The choice is available for single videos and after playlist video selection.
-Single Resolution retains the previous quality/audio buttons and filenames.
+Single Resolution retains the previous quality/audio buttons.
 Multiple Resolutions has checkboxes, a selected-count Start button, Back and
 Cancel. Best is first, followed by 2160p, 1440p, 1080p, 720p, 480p, 360p,
 240p and 144p. Single-video choices follow the existing format analysis; playlist
@@ -196,13 +197,17 @@ Spring Boot course_720p.mp4
 ```
 
 Captions show the same quality label. The part-size limit and keyframe-based
-splitter apply independently to each version. Actual available height is used
+splitter apply independently to each version. The available quality tier is used
 in filenames, so a requested 1080p version that resolves to 720p is named 720p.
-Best is labeled `best_<actual-height>p`. A source is never lowered merely to
+Slightly cropped encodes such as 1078/718 pixels use the familiar 1080p/720p
+labels; substantially different heights such as 960p retain their actual height.
+The original pixel dimensions and encoded media stay intact. Best captions read
+`Best · 1080p`, with `best_1080p` in filenames. A source is never lowered merely to
 fit the per-attachment size ceiling.
 
 If Best selects the same stream as 1080p, that stream is uploaded once, under
-its Best filename; the duplicate selection is reported as skipped. Likewise,
+its Best filename; the duplicate placeholder is deleted immediately and the
+skip is recorded in `/logs` and queue counts. Likewise,
 different requested heights resolving to an already-delivered stream are
 skipped. Duplicate detection runs before upload; for streaming inputs it
 requires no duplicate media download. A failed version is not marked delivered,
@@ -217,6 +222,23 @@ A failed version does not prevent trying later qualities/videos. Cancellation
 stops further variants and drains current cleanup; already delivered media stays
 available. Repeated Start taps consume the session once and cannot enqueue a
 second job. The same in-memory session and queue restart limitations still apply.
+
+Videos now carry compact title/quality/part captions plus two searchable tags:
+one for the course and one for that course's resolution. Every later part replies
+to the first video of its resolution; the first video of another resolution replies
+to the course's original video. Tapping the reply preview navigates back to the
+matching first part. This uses native Telegram replies instead of separate folder
+messages and keeps each part available immediately. Private bot chats do not have
+per-course folders; albums would require holding all parts until the batch is ready.
+If a reply target is deleted, publication can proceed without that reference.
+
+Bot-owned transfer errors, cancellations and completion summaries automatically
+delete five minutes after their terminal update. Successful progress placeholders
+and duplicate notices are removed immediately. Media messages and user commands
+are never scheduled for this cleanup; a reused active status cancels its old timer.
+Deletion uses bounded retries and logs failures without disrupting transfers.
+Timers run in the bot process and are cancelled at shutdown; notices left by an
+earlier deployment are not retroactively deleted after a restart.
 
 ---
 

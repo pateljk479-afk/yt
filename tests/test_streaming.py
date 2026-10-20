@@ -712,7 +712,7 @@ async def test_real_split_parts_preserve_frames_audio_and_independent_playback(
         assert len(data) <= config.VIDEO_PART_SIZE_BYTES
         assert message.media.attributes[1].file_name.endswith(f"_part_{index:02d}.mp4")
         assert message.media.attributes[1].file_name.endswith(f"_{plan.output_quality}_part_{index:02d}.mp4")
-        assert plan.output_quality.replace("_", " · ") in message.message
+        assert ("Best · 1080p" if known_size else "1080p") in message.message
         assert f"Part {index}" in message.message
         assert message.media.attributes[0].duration > 0
         output = tmp_path / f"part-{index}.mp4"

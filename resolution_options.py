@@ -25,8 +25,28 @@ def video_choices(session=None):
 
 
 def resolution_tag(key, height):
-    actual = f"{int(height)}p" if height else "source"
+    actual = f"{nominal_height(height)}p" if height else "source"
     return f"best_{actual}" if key == "max" else actual
+
+
+def nominal_height(height):
+    """Name lightly cropped encodes by their standard resolution tier.
+
+    Keep nonstandard sizes unchanged and never promote a genuinely lower
+    resolution (for example, 960p is not 1080p). Actual pixel dimensions remain
+    unchanged in the media and Telegram's video attributes.
+    """
+    height = int(height or 0)
+    for tier in (4320, 2160, 1440, 1080, 720, 480, 360, 240, 144):
+        if abs(height - tier) <= max(2, min(8, tier // 100)):
+            return tier
+    return height
+
+
+def resolution_label(tag):
+    if tag.startswith("best_"):
+        return "Best · " + ("Source quality" if tag[5:] == "source" else tag[5:])
+    return "Source quality" if tag == "source" else tag
 
 
 def stream_identity(plan):

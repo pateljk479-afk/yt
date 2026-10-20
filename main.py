@@ -125,6 +125,8 @@ async def main():
         heartbeat_task.cancel()
         logger.info("Shutting down service...")
         await playlist_queue.close()
+        from chat_ui import close_notice_cleanup
+        await close_notice_cleanup()
         await app.stop()
         if web_runner:
             await web_runner.cleanup()

@@ -4,7 +4,6 @@ Telegram's streamed-upload protocol uses total_parts=-1 until EOF:
 https://core.telegram.org/api/files#streamed-uploads
 """
 import asyncio
-import html
 import io
 import logging
 import math
@@ -20,15 +19,16 @@ from urllib.parse import urlsplit
 import aiohttp
 from PIL import Image
 from pyrogram import raw, enums
-from pyrogram.errors import FloodWait, InternalServerError
+from pyrogram.errors import FloodWait, InternalServerError, RPCError
 from pyrogram.session import Session
 
 import config
 from downloader import extract_info, sanitize_filename
-from uploader import human_readable_size, human_readable_time
 from direct_download import DirectRangeRelay, media_headers
 from upload_tuning import AdaptiveUploadWindow, previous_upload_setting, remember_upload_setting
 from video_parts import FragmentedVideo, plan_parts
+from resolution_options import nominal_height, resolution_tag
+from chat_ui import video_caption
 from transfer_runtime import (bounded, retry_stage, close_media_sessions,
                               TransferStageError)
 
@@ -48,6 +48,7 @@ class StreamPlan:
     # Matches the playlist's cleanup contract; streamed videos own no disk files.
     temp_dir: str = None
     output_quality: str = ""
+    collection: object = None
 
 
 @dataclass
@@ -102,7 +103,7 @@ def select_streams(info, quality_key, max_quality_height=None):
     if info.get("is_live") or info.get("live_status") == "is_live":
         raise UnsupportedStream("Live streams require the regular downloader")
     duration = int(info.get("duration") or 0)
-    height = (max_quality_height or 4320) if quality_key == "max" else int(quality_key)
+    height = nominal_height((max_quality_height or 4320) if quality_key == "max" else int(quality_key))
     formats = [f for f in info.get("formats", [])
                if f.get("protocol") in ("https", "http", "m3u8", "m3u8_native")
                and urlsplit(f.get("url", "")).scheme in ("http", "https")
@@ -110,7 +111,7 @@ def select_streams(info, quality_key, max_quality_height=None):
                and not f.get("has_drm")]
     videos = sorted((f for f in formats
                      if f.get("vcodec") not in (None, "none")
-                     and f.get("ext") in ("mp4", "webm") and 0 < (f.get("height") or 0) <= height),
+                     and f.get("ext") in ("mp4", "webm") and 0 < nominal_height(f.get("height")) <= height),
                     key=lambda f: (f.get("height") or 0, f.get("ext") == "mp4", f.get("tbr") or 0), reverse=True)
     audios = sorted((f for f in formats if f.get("vcodec") == "none"
                      and f.get("acodec") not in (None, "none") and f.get("ext") in ("m4a", "webm")),
@@ -514,7 +515,8 @@ async def stream_local_video(client, chat_id, result, progress=None, stats=None)
     """Split a disk-fallback result through the same bounded MP4/MTProto path."""
     plan = StreamPlan({"title": result.title, "duration": result.duration},
                       [{"width": result.width, "height": result.height}], result.file_size,
-                      output_quality=getattr(result, "output_quality", ""))
+                      output_quality=getattr(result, "output_quality", ""),
+                      collection=getattr(result, "collection", None))
     stats = stats or TransferStats(transfer_id=secrets.token_hex(4))
     stats.transfer_id = stats.transfer_id or secrets.token_hex(4)
     async def run(checkpoint):
@@ -559,15 +561,9 @@ async def _publish_video_part(client, chat_id, plan, file, filename, size, durat
     """A stable SendMedia random_id prevents duplicate posts after timeouts."""
     info, video = plan.info, plan.formats[0]
     thumb = await _thumbnail(client, info.get("thumbnail"))
-    title = html.escape(str(info.get("title", "Video")))
-    caption = f"🎬 <b>{title}</b>"
-    if plan.output_quality:
-        caption += f"\n🎞️ <b>Quality:</b> {html.escape(plan.output_quality.replace('_', ' · '))}"
-    if index is not None:
-        caption += (f"\n📦 <b>Part {index}</b> · Original quality\n"
-                    f"🕒 {human_readable_time(int(start))} – {human_readable_time(math.ceil(start + duration))}")
-    caption += (f"\n\n⏱️ <b>Duration:</b> {human_readable_time(math.ceil(duration))}\n"
-                f"💾 <b>Size:</b> {human_readable_size(size)}")
+    quality = plan.output_quality or resolution_tag("source", video.get("height"))
+    caption = video_caption(info.get("title", "Video"), quality, size, duration,
+                            plan.collection, index, start)
     media = raw.types.InputMediaUploadedDocument(
         file=file, mime_type="video/mp4", thumb=thumb,
         attributes=[raw.types.DocumentAttributeVideo(
@@ -580,12 +576,27 @@ async def _publish_video_part(client, chat_id, plan, file, filename, size, durat
                              config.TRANSFER_STAGE_TIMEOUT)
     request = raw.functions.messages.SendMedia(
         peer=peer, media=media, random_id=client.rnd_id(),
-        message=parsed["message"], entities=parsed["entities"])
+        message=parsed["message"], entities=parsed["entities"],
+        reply_to_msg_id=plan.collection.reply_to(quality) if plan.collection else None)
     # Keep exactly this request (including random_id and uploaded file) for all
     # attempts. A lost response must not cause a fresh upload or duplicate post.
-    return await retry_stage(f"Publish {filename}", lambda: client.invoke(
-        request, retries=0, timeout=config.TRANSFER_STAGE_TIMEOUT, sleep_threshold=0),
-        config.TRANSFER_STAGE_TIMEOUT)
+    async def publish():
+        try:
+            return await client.invoke(request, retries=0, timeout=config.TRANSFER_STAGE_TIMEOUT, sleep_threshold=0)
+        except RPCError as exc:
+            if request.reply_to_msg_id and getattr(exc, "ID", "") in (
+                    "MESSAGE_ID_INVALID", "REPLY_MESSAGE_ID_INVALID", "REPLY_TO_MESSAGE_ID_INVALID"):
+                # A user may delete the first part between uploads. Grouping
+                # must not make an otherwise valid media transfer fail.
+                if plan.collection:
+                    plan.collection.forget(request.reply_to_msg_id)
+                request.reply_to_msg_id = None
+                raise OSError("Collection's first message was removed; retrying without the reply link") from exc
+            raise
+    sent = await retry_stage(f"Publish {filename}", publish, config.TRANSFER_STAGE_TIMEOUT)
+    if plan.collection:
+        plan.collection.record(sent, quality, request.random_id)
+    return sent
 
 
 async def _validate_video_end(process, errors, relay, expected):

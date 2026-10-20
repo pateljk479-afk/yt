@@ -400,7 +400,9 @@ from streaming import (StreamPlan, TransferStats, UnsupportedStream,
                        telegram_speed_probe)
 from video_parts import plan_parts
 from resolution_options import (ordered_qualities, quality_name, quality_summary,
-                                resolution_tag, stream_identity, video_choices)
+                                resolution_tag, stream_identity, video_choices, nominal_height)
+from chat_ui import (VideoCollection, video_caption, expire_notice,
+                     cancel_notice_cleanup)
 from session_manager import session_manager, PlaylistSession, VideoSession
 from playlist_queue import playlist_queue, PlaylistJob
 from keyboards import (
@@ -506,6 +508,7 @@ class ThrottledProgressUpdater:
     async def _safe_edit(self, text: str):
         if not self.active:
             return
+        cancel_notice_cleanup(self.message)
         try:
             await self.message.edit_text(text)
         except FloodWait as e:
@@ -1007,6 +1010,7 @@ async def handle_video_request(client: Client, message: Message, url: str):
     except Exception as e:
         logger.error("Failed to process video %s: %s", url, e, exc_info=True)
         await status_msg.edit_text(f"❌ <b>Error:</b> Unable to process video.\n<code>{str(e)[:300]}</code>")
+        expire_notice(status_msg)
 
 
 async def handle_playlist_request(client: Client, message: Message, url: str):
@@ -1018,6 +1022,7 @@ async def handle_playlist_request(client: Client, message: Message, url: str):
         entries = list(info.get("entries", []))
         if not entries:
             await status_msg.edit_text("❌ <b>No videos found in this playlist.</b>")
+            expire_notice(status_msg)
             return
 
         title = info.get("title", "YouTube Playlist")
@@ -1036,6 +1041,7 @@ async def handle_playlist_request(client: Client, message: Message, url: str):
     except Exception as e:
         logger.error("Failed to process playlist %s: %s", url, e, exc_info=True)
         await status_msg.edit_text(f"❌ <b>Error:</b> Unable to extract playlist.\n<code>{str(e)[:300]}</code>")
+        expire_notice(status_msg)
 
 
 # =====================================================================
@@ -1055,6 +1061,7 @@ async def callback_pl_cancel(client: Client, callback: CallbackQuery):
         return
     session_manager.remove_session(session_id)
     await callback.message.edit_text("❌ <i>Playlist selection cancelled.</i>")
+    expire_notice(callback.message)
     await callback.answer("Cancelled")
 
 
@@ -1066,6 +1073,7 @@ async def callback_vid_cancel(client: Client, callback: CallbackQuery):
         return
     session_manager.remove_session(session_id)
     await callback.message.edit_text("❌ <i>Video download cancelled.</i>")
+    expire_notice(callback.message)
     await callback.answer("Cancelled")
 
 
@@ -1324,6 +1332,8 @@ async def _enqueue_playlist_selection(client, callback, session, quality_key):
             except Exception:
                 logger.debug("Cancelled playlist message unavailable", exc_info=True)
             raise
+        finally:
+            expire_notice(status_msg)
     job = PlaylistJob(callback.message.chat.id, session.playlist_title,
                       selected_entries,
                       quality_summary(quality_key) if isinstance(quality_key, tuple) else quality_key,
@@ -1382,6 +1392,7 @@ async def callback_vid_start_download(client: Client, callback: CallbackQuery):
 
 async def prepare_download(status_msg, url, quality_key, max_quality_height=None, metadata=None):
     """Prepare stream metadata or a disk download; drain workers on cancel."""
+    cancel_notice_cleanup(status_msg)
     updater = ThrottledProgressUpdater(status_msg, stage="Downloading 📥")
     stopped = threading.Event()
     def progress(data):
@@ -1434,16 +1445,20 @@ async def process_single_download(
     # Uploads have their own slot, so a completed file doesn't block the next
     # download even on a server configured with one download worker.
     async with upload_semaphore:
+        cancel_notice_cleanup(status_msg)
         updater = ThrottledProgressUpdater(status_msg, stage="Downloading 📥")
         temp_dir = prepared_result.temp_dir if prepared_result else None
+        status_removed = False
         try:
             result = prepared_result
             if result is None:
                 result = await prepare_download(status_msg, url, quality_key, max_quality_height)
             temp_dir = result.temp_dir
-            if filename_quality:
+            if isinstance(result, StreamPlan) or not result.is_audio:
                 height = result.formats[0].get("height") if isinstance(result, StreamPlan) else result.height
-                result.output_quality = resolution_tag(filename_quality, height)
+                result.output_quality = resolution_tag(filename_quality or quality_key, height)
+                if getattr(result, "collection", None) is None:
+                    result.collection = VideoCollection(chat_id, url)
 
             if isinstance(result, StreamPlan) or (not result.is_audio and result.file_size > video_part_limit()):
                 updater.stage = "Transferring to Telegram 📤"
@@ -1483,7 +1498,7 @@ async def process_single_download(
                     sender = stream_video if isinstance(result, StreamPlan) else stream_local_video
                     await sender(client, chat_id, result, part_progress, stats=active_transfer_stats)
                 try:
-                    await best_effort_status(status_msg.delete())
+                    status_removed = bool(await best_effort_status(status_msg.delete()))
                 except Exception:
                     pass
                 return True
@@ -1504,16 +1519,16 @@ async def process_single_download(
             await best_effort_status(status_msg.edit_text("📤 <i>Uploading to Telegram at maximum speed...</i>"))
 
             caption = (
-                f"🎬 <b>{result.title}</b>\n\n"
+                f"🎵 <b>{escape(result.title)}</b>\n\n"
                 f"⏱️ <b>Duration:</b> {human_readable_time(result.duration)}\n"
                 f"💾 <b>Size:</b> {human_readable_size(result.file_size)}"
-            )
+            ) if result.is_audio else video_caption(result.title, result.output_quality,
+                result.file_size, result.duration, result.collection)
 
             # Format file name preserving original YouTube title
             clean_filename = sanitize_filename(result.title) + (".mp3" if result.is_audio else ".mp4")
-            if filename_quality and not result.is_audio:
+            if not result.is_audio:
                 clean_filename = sanitize_filename(result.title) + "_" + result.output_quality + ".mp4"
-                caption += f"\n🎞️ <b>Quality:</b> {escape(result.output_quality.replace('_', ' · '))}"
 
             max_upload_retries = 3
             upload_success = False
@@ -1539,7 +1554,7 @@ async def process_single_download(
                             progress=updater.async_upload_hook,
                         )
                     else:
-                        await client.send_video(
+                        sent_message = await client.send_video(
                             chat_id=chat_id,
                             video=result.file_path,
                             caption=caption,
@@ -1550,7 +1565,9 @@ async def process_single_download(
                             file_name=clean_filename,
                             supports_streaming=True,
                             progress=updater.async_upload_hook,
+                            reply_to_message_id=result.collection.reply_to(result.output_quality),
                         )
+                        result.collection.record(sent_message, result.output_quality)
                     upload_success = True
                     break
                 except (TimeoutError, OSError, ConnectionError) as err:
@@ -1566,7 +1583,7 @@ async def process_single_download(
 
             updater.active = False
             try:
-                await best_effort_status(status_msg.delete())
+                status_removed = bool(await best_effort_status(status_msg.delete()))
             except Exception:
                 pass
             return True
@@ -1582,6 +1599,8 @@ async def process_single_download(
         finally:
             active_transfer_stats = None
             updater.active = False
+            if not status_removed:
+                expire_notice(status_msg)
             if temp_dir:
                 safe_cleanup(temp_dir)
 
@@ -1598,12 +1617,14 @@ async def process_multiple_resolutions(client, status_msg, chat_id, entries, qua
         if not url.startswith("http"):
             url = "https://www.youtube.com/watch?v=" + (entry.get("id") or url)
         metadata = None
+        collection = VideoCollection(chat_id, url)
         delivered = set()
         item_failed = False
         if job:
             job.current, job.current_title = index, title
         for key in qualities:
             prepared = item_status = None
+            notice_finished = False
             if job:
                 job.stage = f"Preparing / uploading {quality_name(key)}"
             logger.info("Multiple-resolution transfer job=%s video=%d/%d quality=%s title=%s",
@@ -1626,21 +1647,20 @@ async def process_multiple_resolutions(client, status_msg, chat_id, entries, qua
                     identity = ("disk", actual_height, prepared.width)
                 if identity in delivered:
                     skipped += 1
-                    actual_name = f"{actual_height}p" if actual_height else "source-quality"
-                    try:
-                        await best_effort_status(item_status.edit_text(
-                            f"↪️ <b>{quality_name(key)} skipped:</b> the same {actual_name} "
-                            "version was already delivered for this video."))
-                    except Exception:
-                        logger.debug("Duplicate-version status unavailable")
+                    # This is successful deduplication, not an error. Keep the
+                    # detail in /logs and remove its placeholder from the chat.
+                    if item_status is not status_msg:
+                        notice_finished = bool(await best_effort_status(item_status.delete()))
                     logger.info("Multiple-resolution duplicate skipped video=%d requested=%s actual=%s",
                                 index, key, actual_height)
                     continue
-                if key != "max" and actual_height and int(key) != actual_height:
+                if key != "max" and actual_height and int(key) != nominal_height(actual_height):
                     logger.info("Resolution fallback video=%d requested=%sp actual=%sp; filename uses actual height",
                                 index, key, actual_height)
+                prepared.collection = collection
                 success = await process_single_download(
                     client, item_status, chat_id, url, key, prepared_result=prepared, filename_quality=key)
+                notice_finished = success
                 if success:
                     delivered.add(identity)
                     sent += 1
@@ -1658,6 +1678,8 @@ async def process_multiple_resolutions(client, status_msg, chat_id, entries, qua
                     except Exception:
                         logger.debug("Variant error status unavailable")
             finally:
+                if item_status is not None and item_status is not status_msg and not notice_finished:
+                    expire_notice(item_status)
                 if prepared is not None:
                     safe_cleanup(prepared.temp_dir)
                 if job:
@@ -1683,6 +1705,8 @@ async def process_multiple_resolutions(client, status_msg, chat_id, entries, qua
             f"↪️ Duplicate versions skipped: {skipped}"))
     except Exception:
         logger.debug("Multiple-resolution final status unavailable")
+    finally:
+        expire_notice(status_msg)
 
 
 async def process_playlist_downloads(
@@ -1720,6 +1744,7 @@ async def process_playlist_downloads(
             )
         except Exception as e:
             logger.debug("Final status edit skipped: %s", e)
+        expire_notice(status_msg)
         return
 
     if getattr(config, "PREFETCH_PLAYLIST", False):
@@ -1750,6 +1775,7 @@ async def process_playlist_downloads(
                             f"❌ <b>Download Failed:</b>\n<code>{escape(str(e)[:300])}</code>"))
                     except Exception:
                         pass
+                    expire_notice(item_status)
                 return None
 
         pending = asyncio.create_task(prepare_item(1, entries[0])) if entries else None
@@ -1811,6 +1837,7 @@ async def process_playlist_downloads(
                             f"❌ <b>Download Failed:</b>\n<code>{escape(str(e)[:300])}</code>"))
                     except Exception:
                         pass
+                    expire_notice(item_status)
                 failed += 1
                 progress()
                 continue
@@ -1844,3 +1871,5 @@ async def process_playlist_downloads(
         await best_effort_status(status_msg.edit_text(summary_text))
     except Exception as e:
         logger.debug("Final status edit skipped: %s", e)
+    finally:
+        expire_notice(status_msg)
