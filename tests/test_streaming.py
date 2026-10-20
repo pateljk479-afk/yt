@@ -77,16 +77,16 @@ def test_large_selection_is_independent_of_disk_budget(monkeypatch):
     assert plan.temp_dir is None
 
 
-def test_selection_degrades_only_for_telegram_limit_and_respects_height(monkeypatch):
+def test_selection_preserves_quality_despite_attachment_limit(monkeypatch):
     monkeypatch.setattr(config, "MAX_FILE_SIZE", 1000 * 1024 * 1024)
-    assert streaming.select_streams(metadata(), "max").formats[0]["height"] == 720
+    assert streaming.select_streams(metadata(), "max").formats[0]["height"] == 1080
     assert streaming.select_streams(metadata(), "720").formats[0]["height"] == 720
     with pytest.raises(streaming.UnsupportedStream):
         streaming.select_streams(metadata(), "480")
 
 
 @pytest.mark.parametrize("update", [{"is_live": True}, {"formats": []},
-    {"formats": [{**metadata()["formats"][0], "protocol": "m3u8_native"}]}])
+    {"formats": [{**metadata()["formats"][0], "protocol": "http_dash_segments"}]}])
 def test_unsupported_sources_use_explicit_fallback(update):
     with pytest.raises(streaming.UnsupportedStream):
         streaming.select_streams({**metadata(), **update}, "1080")
@@ -588,3 +588,158 @@ async def test_real_ffmpeg_direct_http_mux_and_telegram_finalization(tmp_path, m
     output.write_bytes(reconstructed)
     subprocess.run([ffmpeg, "-v", "error", "-i", str(output), "-map", "0:v", "-map", "0:a",
                     "-f", "null", "-"], check=True, capture_output=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_size", [False, True])
+@pytest.mark.parametrize("codec", ["libx264", "libvpx-vp9"])
+async def test_real_split_parts_preserve_frames_audio_and_independent_playback(
+        tmp_path, monkeypatch, telegram, known_size, codec):
+    ffmpeg = ffmpeg_executable()
+    extension = "webm" if codec == "libvpx-vp9" else "mp4"
+    video, audio = tmp_path / f"video.{extension}", tmp_path / "audio.m4a"
+    codec_args = ["-deadline", "realtime", "-cpu-used", "8"] if codec == "libvpx-vp9" else [
+        "-keyint_min", "25", "-sc_threshold", "0", "-bf", "2"]
+    subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=320x240:rate=25:duration=8", "-c:v", codec,
+                    "-g", "25", *codec_args,
+                    "-b:v", "500k", str(video)], check=True, capture_output=True)
+    subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "sine=frequency=400:duration=8", "-c:a", "aac", str(audio)],
+                   check=True, capture_output=True)
+
+    async def serve(request):
+        return web.FileResponse(video if request.path == "/v" else audio)
+
+    app = web.Application()
+    app.router.add_get("/{name}", serve)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    info = metadata()
+    info["duration"] = 8
+    for fmt, name, path in zip(info["formats"], ["v", "a"], [video, audio]):
+        fmt["url"] = f"http://127.0.0.1:{port}/{name}"
+        fmt["filesize"] = path.stat().st_size if known_size else None
+        fmt["tbr"] = fmt["abr"] = 0
+    info["formats"][0]["ext"] = extension
+    info["formats"][0]["vcodec"] = "vp9" if extension == "webm" else "avc1"
+    plan = streaming.select_streams(info, "1080")
+    if not known_size:
+        plan.estimated_size = 0
+    monkeypatch.setattr(config, "STREAM_PARALLEL_DOWNLOADS", known_size)
+    monkeypatch.setattr(config, "VIDEO_PART_SIZE_BYTES", 190_000)
+    monkeypatch.setattr(config, "DOWNLOAD_STORAGE_LIMIT_BYTES", 1)
+    monkeypatch.setattr(streaming.shutil, "which", lambda _: ffmpeg)
+    client = fake_client()
+    stats = streaming.TransferStats()
+    try:
+        await asyncio.wait_for(streaming.stream_video(client, 1, plan, stats=stats), 30)
+    finally:
+        await runner.cleanup()
+    messages = [call.args[0] for call in client.invoke.call_args_list]
+    assert len(messages) >= 3 and stats.completed_parts == len(messages)
+    frame_hashes, all_audio_samples = [], 0
+    packet_counts = []
+    for index, message in enumerate(messages, 1):
+        file_id = message.media.file.id
+        calls = sorted([r for r in telegram[0] if r.file_id == file_id], key=lambda r: r.file_part)
+        data = b"".join(r.bytes for r in calls)
+        assert len(data) <= config.VIDEO_PART_SIZE_BYTES
+        assert message.media.attributes[1].file_name.endswith(f"_part_{index:02d}.mp4")
+        assert f"Part {index}" in message.message
+        assert message.media.attributes[0].duration > 0
+        output = tmp_path / f"part-{index}.mp4"
+        output.write_bytes(data)
+        # Decode EVERY part by itself, including B-frames and separate AAC audio.
+        decoded = subprocess.run([ffmpeg, "-v", "error", "-xerror", "-i", str(output),
+                                  "-map", "0:v", "-f", "framemd5", "-"],
+                                 check=True, capture_output=True).stdout.decode()
+        frame_hashes += [line.split(",")[-1].strip() for line in decoded.splitlines()
+                         if line and not line.startswith("#")]
+        samples = subprocess.run([ffmpeg, "-v", "error", "-xerror", "-i", str(output),
+                                  "-map", "0:a", "-f", "s16le", "-"],
+                                 check=True, capture_output=True).stdout
+        assert samples
+        all_audio_samples += len(samples) // 2
+        packet_counts.append(data.count(b"moof"))
+    original = subprocess.run([ffmpeg, "-v", "error", "-i", str(video), "-f", "framemd5", "-"],
+                              check=True, capture_output=True).stdout.decode()
+    expected = [line.split(",")[-1].strip() for line in original.splitlines()
+                if line and not line.startswith("#")]
+    assert frame_hashes == expected  # No missing, reordered, duplicated or changed frames.
+    assert abs(all_audio_samples - 8 * 44100) < 2048
+    assert sum(packet_counts) == 8
+    assert all(session.stop.await_count == 1 for session in telegram[1])
+
+
+@pytest.mark.asyncio
+async def test_later_delivery_failure_reports_previously_sent_part(tmp_path, monkeypatch, telegram):
+    ffmpeg = ffmpeg_executable()
+    source = tmp_path / "course.mp4"
+    subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=320x240:rate=25:duration=5", "-f", "lavfi", "-i",
+                    "sine=duration=5", "-c:v", "libx264", "-g", "25", "-sc_threshold", "0",
+                    "-c:a", "aac", "-shortest", str(source)], check=True, capture_output=True)
+    monkeypatch.setattr(streaming.shutil, "which", lambda _: ffmpeg)
+    monkeypatch.setattr(config, "VIDEO_PART_SIZE_BYTES", 80_000)
+    result = SimpleNamespace(file_path=str(source), title="Course", duration=5,
+                             width=320, height=240, file_size=source.stat().st_size)
+    client, stats = fake_client(), streaming.TransferStats()
+    client.invoke.side_effect = [object(), RuntimeError("SendMedia failed")]
+    with pytest.raises(RuntimeError, match=r"after 1 part\(s\) were delivered"):
+        await streaming.stream_local_video(client, 1, result, stats=stats)
+    assert stats.completed_parts == 1
+    assert client.invoke.await_count == 2
+    first = client.invoke.call_args_list[0].args[0]
+    assert first.media.attributes[1].file_name == "Course_part_01.mp4"
+    assert all(session.stop.await_count == 1 for session in telegram[1])
+
+
+@pytest.mark.asyncio
+async def test_vod_hls_streams_directly_and_splits_without_disk_download(tmp_path, monkeypatch, telegram):
+    ffmpeg = ffmpeg_executable()
+    playlist = tmp_path / "index.m3u8"
+    subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=320x240:rate=25:duration=4", "-f", "lavfi", "-i",
+                    "sine=duration=4", "-c:v", "libx264", "-g", "25", "-sc_threshold", "0",
+                    "-c:a", "aac", "-shortest", "-f", "hls", "-hls_time", "1",
+                    "-hls_list_size", "0", "-hls_segment_filename", str(tmp_path / "seg%02d.ts"),
+                    str(playlist)], check=True, capture_output=True)
+    files = {path.name: path for path in tmp_path.iterdir()}
+
+    async def serve(request):
+        if request.match_info["name"] not in files:
+            raise web.HTTPNotFound()
+        return web.FileResponse(files[request.match_info["name"]])
+
+    app = web.Application()
+    app.router.add_get("/{name}", serve)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    info = {"title": "VOD course", "duration": 4, "formats": [{
+        "url": f"http://127.0.0.1:{port}/index.m3u8", "protocol": "m3u8_native",
+        "ext": "mp4", "height": 1080, "width": 1920, "vcodec": "avc1", "acodec": "mp4a"}]}
+    monkeypatch.setattr(streaming.shutil, "which", lambda _: ffmpeg)
+    monkeypatch.setattr(config, "VIDEO_PART_SIZE_BYTES", 80_000)
+    monkeypatch.setattr(config, "DOWNLOAD_STORAGE_LIMIT_BYTES", 1)
+    client = fake_client()
+    try:
+        await asyncio.wait_for(streaming.stream_video(client, 1, streaming.select_streams(info, "1080")), 20)
+    finally:
+        await runner.cleanup()
+    assert client.invoke.await_count > 1
+    for index, call in enumerate(client.invoke.call_args_list, 1):
+        file_id = call.args[0].media.file.id
+        data = b"".join(r.bytes for r in sorted(telegram[0], key=lambda r: r.file_part)
+                        if r.file_id == file_id)
+        output = tmp_path / f"hls-part{index}.mp4"
+        output.write_bytes(data)
+        subprocess.run([ffmpeg, "-v", "error", "-xerror", "-i", str(output),
+                        "-map", "0:v", "-map", "0:a", "-f", "null", "-"],
+                       check=True, capture_output=True)

@@ -118,7 +118,7 @@ class VideoQualityAnalysis:
     available_qualities: List[QualityOption]
     max_quality: Optional[QualityOption]
     audio_size: int
-    excluded_qualities: List[Tuple[str, int]]  # Qualities exceeding 2GB limit
+    excluded_qualities: List[Tuple[str, int]]  # Retained for session compatibility
 
 
 @dataclass
@@ -245,8 +245,7 @@ def estimate_audio_size(formats: list, duration: int) -> int:
 def analyze_video_qualities(info: dict) -> VideoQualityAnalysis:
     """
     Analyze available video formats and estimate sizes.
-    Strictly filters out any quality whose estimated size exceeds MAX_FILE_SIZE (2 GB).
-    Selects the highest remaining quality as 'Max / High Quality'.
+    Keep every quality, irrespective of source size; large videos are split.
     """
     title = info.get("title", "Unknown Video")
     video_id = info.get("id", "")
@@ -314,22 +313,17 @@ def analyze_video_qualities(info: dict) -> VideoQualityAnalysis:
             
         total_estimated = estimated_video_size + audio_size
         
-        # Enforce Telegram 2 GB Limit
-        if total_estimated > config.MAX_FILE_SIZE:
-            logger.info("Quality %s exceeds 2GB (%s bytes) -> EXCLUDED", tier_label, total_estimated)
-            excluded_qualities.append((tier_label, total_estimated))
-        else:
-            selector = f"bv*[height<={tier_height}]+ba[ext=m4a]/bv*[height<={tier_height}]+ba/b[height<={tier_height}]/best"
-            available_qualities.append(
-                QualityOption(
-                    height=tier_height,
-                    label=tier_label,
-                    estimated_size=total_estimated,
-                    format_selector=selector,
-                )
+        selector = f"bv*[height<={tier_height}]+ba[ext=m4a]/bv*[height<={tier_height}]+ba/b[height<={tier_height}]/best"
+        available_qualities.append(
+            QualityOption(
+                height=tier_height,
+                label=tier_label,
+                estimated_size=total_estimated,
+                format_selector=selector,
             )
+        )
             
-    # Mark the highest available quality <= 2 GB as max_quality
+    # Size never lowers the maximum selectable resolution.
     max_quality = None
     if available_qualities:
         # Highest resolution is first in list because RESOLUTION_TIERS is descending
@@ -525,11 +519,11 @@ def _download_media_impl(
 ) -> DownloadResult:
     """
     Download video or audio using optimal multithreaded yt-dlp settings.
-    Ensures MP4 format, 2 GB limit degradation, valid thumbnail extraction, and returns DownloadResult.
+    Preserve selected quality; large video results are split by the sender.
     """
     is_audio = (quality_key == "audio")
     
-    # 1. Determine format selector with strict <= 2GB degradation
+    # 1. Determine the selected quality without a source-size restriction.
     if is_audio:
         format_selector = "ba[ext=m4a]/ba/b"
     elif quality_key == "max":
@@ -547,15 +541,6 @@ def _download_media_impl(
         try:
             requested_h = int(quality_key)
             target_h = requested_h
-            # Check if requested format exceeds 2 GB limit; degrade if necessary
-            try:
-                meta = extract_info(url, is_playlist=False)
-                analysis = analyze_video_qualities(meta)
-                if analysis.max_quality and requested_h > analysis.max_quality.height:
-                    logger.info("Requested quality %dp exceeds 2GB -> degrading to %dp", requested_h, analysis.max_quality.height)
-                    target_h = analysis.max_quality.height
-            except Exception as e:
-                logger.debug("Format check skipped: %s", e)
             format_selector = f"bv*[ext=mp4][height<={target_h}]+ba[ext=m4a]/b[ext=mp4][height<={target_h}]/bv*[height<={target_h}]+ba/best"
         except ValueError:
             format_selector = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/best"
@@ -666,35 +651,9 @@ def _download_media_impl(
                 logger.warning("Failed to download thumbnail fallback from %s: %s", thumb_url, e)
 
     file_size = os.path.getsize(media_file)
-    # Check Telegram 2 GB ceiling: if exceeded, degrade to lower resolution automatically
-    if file_size > config.MAX_FILE_SIZE and not is_audio:
-        logger.warning(
-            "Downloaded file size (%d bytes) exceeds Telegram 2GB limit! Degrading resolution to 720p/480p...",
-            file_size,
-        )
-        try:
-            os.remove(media_file)
-            fallback_selector = "bv*[ext=mp4][height<=720]+ba[ext=m4a]/b[ext=mp4][height<=720]/bv*[height<=720]+ba/best"
-            ydl_opts_fb = build_ydl_options(
-                target_dir=temp_dir,
-                format_selector=fallback_selector,
-                progress_hook=progress_hook,
-                is_audio=is_audio,
-            )
-            info = _extract_with_recovery(url, ydl_opts_fb, True)
-            for fname in os.listdir(temp_dir):
-                fpath = os.path.join(temp_dir, fname)
-                ext = os.path.splitext(fname)[1].lower()
-                if ext in target_exts:
-                    media_file = fpath
-                    break
-            file_size = os.path.getsize(media_file) if media_file and os.path.exists(media_file) else file_size
-        except Exception as e:
-            logger.error("Degradation fallback download failed: %s", e)
-
     # Preserve original YouTube title in file name on disk
-    if file_size > config.MAX_FILE_SIZE:
-        raise ValueError("Downloaded file exceeds the server's storage-safe file size. Choose a lower quality.")
+    if file_size > config.MAX_FILE_SIZE and is_audio:
+        raise ValueError("Audio exceeds Telegram's attachment size limit.")
     clean_base = sanitize_filename(title)
     final_ext = ".mp3" if is_audio else ".mp4"
     desired_filename = f"{clean_base}{final_ext}"

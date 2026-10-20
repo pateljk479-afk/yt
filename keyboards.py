@@ -81,7 +81,7 @@ def build_playlist_quality_keyboard(session_id: str) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton(
-                "⭐ Max Quality / High Quality (Best <= 2GB)",
+                "⭐ Max Quality / High Quality (Auto-split)",
                 callback_data=f"pl_q:{session_id}:max",
             )
         ],
@@ -107,8 +107,7 @@ def build_playlist_quality_keyboard(session_id: str) -> InlineKeyboardMarkup:
 def build_video_quality_keyboard(session: VideoSession) -> InlineKeyboardMarkup:
     """
     Build quality selection keyboard for a single YouTube video.
-    Strictly shows only qualities <= 2GB.
-    Features 'Max Quality / High Quality' button at top picking highest quality under 2GB limit.
+    All available qualities remain selectable; large videos are auto-split.
     """
     keyboard: List[List[InlineKeyboardButton]] = []
     analysis = session.analysis
@@ -123,7 +122,7 @@ def build_video_quality_keyboard(session: VideoSession) -> InlineKeyboardMarkup:
         )
         keyboard.append([top_btn])
 
-    # 2. Available resolution options (only those <= 2GB)
+    # 2. Available resolutions, including sources larger than an attachment.
     row = []
     for q in analysis.available_qualities:
         size_str = human_readable_size(q.estimated_size)

@@ -8,15 +8,17 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 
 1. **⚡ Maximum Speed Optimization (600 Mbps Tuned)**
    - **Video streaming without disk copies**: direct CDN inputs are merged by FFmpeg and uploaded immediately in 512 KiB Telegram chunks, with bounded memory and parallel upload connections.
-   - **Regular downloader acceleration**: audio and manifest-only sources use yt-dlp fragment downloads and 10 MB HTTP chunks.
+   - **Regular downloader acceleration**: audio and unsupported fragment-only sources use yt-dlp fragment downloads and 10 MB HTTP chunks.
    - **C-accelerated MTProto encryption**: Integrates `TgCrypto` for lightning-fast Telegram chunk uploads.
    - **Aria2c integration**: Automatically detects and uses `aria2c` with 16 parallel connections if available on the system.
    - **Memory-bounded concurrency**: Protected by an `asyncio.Semaphore` queue to fully utilize 4 CPU cores while preventing Out-Of-Memory (OOM) errors on 2 GB RAM servers.
 
-2. **🛡️ Smart 2 GB Limit Protection & Automatic Quality Degradation**
-   - Telegram MTProto restricts regular bot file uploads to **2 GB (~2000 MB)**.
+2. **📦 Automatic Playable Video Parts at Original Quality**
+   - The source video can exceed Telegram's per-attachment limit.
    - Format bitrates and stream sizes are evaluated before presenting choices.
-   - **Automatic Degradation**: If 4K is available but exceeds 2 GB (e.g., 2.3 GB), 4K is **filtered out** from the choices. The bot automatically presents **2K (1440p)** or 1080p as the **⭐ Max Quality** option.
+   - **No size-based downgrade**: Max Quality selects the highest available resolution. Large videos arrive as `Title_part_01.mp4`, `Title_part_02.mp4`, etc.
+   - Parts default to at most **1700 MiB** each, balanced from the size estimate. Cuts follow keyframes, preserving encoded video and audio without re-encoding.
+   - Source download, muxing and part uploads share the existing bounded-memory pipeline; a whole part is never held in RAM or staged on disk.
    - Quality options show clear estimated file sizes (e.g., `⭐ Max Quality (2K ~ 1.6 GB)`, `1080p (~850 MB)`, `720p (~450 MB)`).
 
 3. **📋 Interactive 10-Per-Page Playlist Navigation & Multi-Selection**
@@ -47,8 +49,9 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 ├── main.py                 # Application entry point & service lifecycle
 ├── config.py               # Environment variables, tuning parameters, and limits
 ├── bot.py                  # Pyrogram bot client, commands, and callback query handlers
-├── downloader.py           # yt-dlp integration, 2GB filtering, size estimation & downloads
+├── downloader.py           # yt-dlp integration, quality/size estimation & disk fallbacks
 ├── streaming.py            # Direct FFmpeg muxing and bounded Telegram streamed uploads
+├── video_parts.py          # Bounded playable MP4 parts with keyframe cuts and rebased clocks
 ├── direct_download.py      # Parallel CDN ranges through a seekable loopback input
 ├── keyboards.py            # Telegram inline keyboards (quality selection & playlist pagination)
 ├── session_manager.py      # In-memory session state for playlist pagination & selections
@@ -58,7 +61,8 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 ├── .env.example            # Sample configuration file
 ├── .gitignore              # Files and directories excluded from git
 └── tests/                  # Comprehensive automated test suite (33 tests)
-    ├── test_downloader.py      # 2GB degradation, audio size calculation & sanitization
+    ├── test_downloader.py      # Quality preservation, audio sizing & sanitization
+    ├── test_video_parts.py     # Large logical streams, split boundaries, clocks & integrity
     ├── test_uploader.py        # Progress bars, media integrity & thumbnail conversion
     ├── test_session_manager.py # 10-per-page pagination, toggle, select all
     ├── test_keyboards.py       # Inline keyboard layout & 64-byte callback validation
@@ -83,6 +87,7 @@ cp .env.example .env
 | `API_HASH` | Telegram API Hash from [my.telegram.org](https://my.telegram.org) | *Required* |
 | `BOT_TOKEN` | Telegram Bot Token from [@BotFather](https://t.me/BotFather) | *Required* |
 | `MAX_FILE_SIZE` | Max file size in bytes (Telegram 2GB ceiling) | `2097152000` (2000 MB) |
+| `VIDEO_PART_SIZE_MB` | Hard playable-part ceiling in MiB (maximum 1700); memory stays bounded separately | `1700` |
 | `DOWNLOAD_DIR` | Directory for temporary video and thumbnail files | `./downloads` |
 | `CONCURRENT_FRAGMENT_DOWNLOADS` | Number of parallel fragment downloads | `16` |
 | `MAX_CONCURRENT_DOWNLOADS` | Max simultaneous video downloads | `3` |
@@ -122,7 +127,7 @@ python main.py
 |---|---|---|
 | `/start` | `/start` | Welcome message and bot feature overview |
 | `/help` | `/help` | Detailed guide on downloading videos and playlists |
-| `/video` | `/video <url>` | Analyze video, show qualities under 2GB, and download |
+| `/video` | `/video <url>` | Analyze all qualities, transfer and auto-split large videos |
 | `/playlist` | `/playlist <url>` | Open paginated 10-per-page selection interface |
 | `/queue` | `/queue` or `/queue 2` | Show active/waiting playlists, processed/sent/failed counts, current video, and cancel buttons |
 | `/cancelqueue` | `/cancelqueue <job-id>` | Cancel a waiting or running playlist in this chat |
@@ -143,10 +148,10 @@ when the bot restarts; the bot drains the active job before a normal shutdown.
 ### User Flow Example (Single Video):
 1. User sends `/video https://www.youtube.com/watch?v=...`
 2. Bot analyzes stream formats and size limits.
-3. If 4K is > 2GB (e.g. 2.3 GB), it is excluded. 2K (1.6 GB) is selected as **⭐ Max Quality**.
-4. User selects `⭐ Max Quality (2K ~ 1.6 GB)` or `1080p (~850 MB)`.
+3. Even if 4K is 7 GB, it remains the **⭐ Max Quality** option.
+4. User selects the desired resolution; size determines the number of attachments.
 5. Bot streams the download with real-time speed & progress updates.
-6. Bot uploads the streamable MP4 with original YouTube title and thumbnail.
+6. Bot publishes the MP4 or numbered playable parts with title, thumbnail and source time range.
 
 ### User Flow Example (Playlist):
 1. User sends `/playlist https://www.youtube.com/playlist?list=...`
@@ -198,7 +203,44 @@ No complete input, merged output, or video chunk files are written to disk.
 This allows a 1.5 GB video to transfer on a server with a 2 GB disk without
 reserving another 1.5 GB for merging. This uses Telegram's documented
 [streamed-upload protocol](https://core.telegram.org/api/files#streamed-uploads),
-including unknown part counts until EOF; Telegram assembles one final video.
+including unknown transport-chunk counts until EOF. Each playable MP4 part gets
+its own Telegram file identity; transport chunks are not separate chat files.
+
+### Large videos without quality reduction
+
+The source size is analyzed before transfer (exact CDN range sizes replace
+approximate metadata when available). `VIDEO_PART_SIZE_MB=1700` sets the hard
+per-attachment ceiling in MiB, also bounded by `MAX_FILE_SIZE`. A 7–7.5 GiB video
+typically needs five parts; a 2–2.5 GiB video needs two. The initial count is the
+minimum estimate divided by the hard ceiling, rounded up. Targets balance bytes
+across those parts with up to 2% muxing room, without adding a part purely for
+that reserve. Unknown sizes use the full ceiling, and actual bytes always override estimates. Variable
+bitrate, estimates and keyframe placement can change the final part count or
+duration. Part boundaries follow video keyframes rather than exact hour marks.
+
+One FFmpeg process copies the selected encoded streams into fragmented MP4.
+`video_parts.py` reads only bounded metadata, repeats the initialization for
+each attachment, and rebases fragment clocks for independent playback while
+preserving audio/video timing. Media payload passes through in 512 KiB reads.
+The 128 MiB producer queue and existing parallel Telegram windows remain active;
+neither the full video nor a full 1700 MiB part is held in RAM or saved to disk.
+An 8 MiB FFmpeg fragment-size target also bounds normal muxer read-ahead. No new
+Python dependency, transcoding or repeated download is required.
+
+Parts arrive immediately after their upload completes, with filenames such as
+`Spring Boot course_part_01.mp4`, original quality, per-part duration and original
+timeline range in captions. Small videos retain their original filename. Logs
+record the initial plan and each part's byte count, time range and publication.
+Progress resets its byte/speed counters for each numbered part. If a later part
+fails, already sent parts stay available and the error reports the partial
+delivery; restart-resume of unsent parts is not implemented.
+
+The splitter rejects malformed/truncated fragments and never publishes a
+part that starts without a keyframe. The last part additionally requires a
+successful FFmpeg exit and full-source duration check. Extremely long keyframe
+intervals that cannot fit the hard limit fail explicitly rather than degrading
+quality. Audio conversion and fragment-only formats without a playable HTTP/HLS
+URL may still use the disk fallback; that path requires enough local space.
 
 The direct downloader requests small HTTP ranges in parallel (8 connections
 and 2 MiB ranges per input by default), preserving byte order and supporting
@@ -236,8 +278,8 @@ data path. These buffers plus CDN ranges and subprocess/network/FFmpeg buffers
 use RAM, not disk. Once the buffer fills, backpressure pauses downloading.
 Chunks retry up to five times while their bytes remain in memory. Failed chunks,
 source timeouts and cancellation stop the transfer and close the upload sessions.
-Incomplete or failed FFmpeg output is never published to the chat. Actual byte
-counts still enforce `MAX_FILE_SIZE` and the standard 2000 MiB upload ceiling.
+Incomplete current parts are not published; previously completed parts survive
+a later error. Actual bytes enforce limits per attachment, not per source video.
 Transfer speed depends on CDN and Telegram throughput as well as server bandwidth.
 
 FFmpeg must be installed and on PATH. `STREAM_READ_TIMEOUT=90` bounds a stalled
@@ -255,8 +297,8 @@ threads are clamped to 1–8. Existing environment values override new defaults;
 update old `UPLOAD_WORKERS=4`, `STREAM_BUFFER_MB=32` and download settings if
 you want the new initial profile. `/logs` records every adaptive window change.
 Set `STREAM_VIDEO_UPLOADS=false` to use the regular disk path.
-Audio conversion and sources without complete HTTP MP4/M4A resources (such as
-manifest-only formats) also use that path. Its temporary storage is bounded by
+Audio conversion and unsupported fragment-list-only sources use that path.
+Direct MP4/WebM resources and VOD HLS can use the streaming splitter. Disk storage is bounded by
 `DOWNLOAD_STORAGE_LIMIT_MB` (default 1536 MiB) and `MIN_FREE_DISK_MB=128`.
 It still needs room for the downloaded inputs and merged/converted output.
 Failed folders are removed immediately; startup removes only abandoned `yt_dl_*`
@@ -289,7 +331,7 @@ proxy credentials are not included in the new transfer diagnostics.
 With `YOUTUBE_PROXY` configured, YouTube metadata uses the proxy, but video,
 audio and thumbnails ALWAYS use direct server connections. The streaming
 FFmpeg process explicitly disables HTTP proxies and removes inherited proxy
-environment variables; only complete HTTP resources are accepted as inputs.
+environment variables; supported HTTP resources and VOD HLS read directly.
 For the regular disk path, native yt-dlp downloading is used instead of aria2
 so request routing is enforced. Logs report direct routing. Telegram uploads
 do not use the YouTube proxy.
@@ -309,7 +351,7 @@ python -m pytest -v
 ```
 
 All 27 test cases test:
-- 2 GB file degradation and max quality determination
+- Original-quality selection and automatic playable-part limits
 - Audio size estimation from bitrates and formats
 - Filename sanitization against filesystem forbidden characters
 - Telegram 64-byte callback_data compliance

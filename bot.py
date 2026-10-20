@@ -383,7 +383,9 @@ from downloader import (
     validate_youtube_cookie_file,
 )
 from streaming import (StreamPlan, TransferStats, UnsupportedStream,
-                       prepare_stream, stream_video, telegram_speed_probe)
+                       prepare_stream, stream_video, stream_local_video, video_part_limit,
+                       telegram_speed_probe)
+from video_parts import plan_parts
 from session_manager import session_manager, PlaylistSession, VideoSession
 from playlist_queue import playlist_queue, PlaylistJob
 from keyboards import (
@@ -514,8 +516,8 @@ async def start_command(client: Client, message: Message):
         "👋 <b>Welcome to High-Speed YouTube Downloader Bot!</b>\n\n"
         "⚡ <b>Features:</b>\n"
         "• Download single YouTube videos or entire playlists\n"
-        "• Quality selection (Max High Quality up to 2 GB limit)\n"
-        "• Automatic quality degradation if file exceeds 2 GB\n"
+        "• Select the original quality, including large videos\n"
+        "• Large videos arrive as numbered, playable MP4 parts\n"
         "• Interactive 10-per-page playlist navigation & multi-selection\n"
         "• Original file names and original YouTube thumbnails\n"
         "• Optimized MP4 streams ready for Telegram player playback\n\n"
@@ -540,8 +542,8 @@ async def help_command(client: Client, message: Message):
         "<b>1. Downloading a Single Video:</b>\n"
         "• Send <code>/video https://youtu.be/...</code>\n"
         "• You will see available resolutions (4K, 2K, 1080p, 720p, etc.)\n"
-        "• <i>Note:</i> Videos over 2 GB are automatically degraded to ensure Telegram upload compatibility.\n"
-        "• Click <b>⭐ Max Quality</b> for the highest quality under 2 GB.\n\n"
+        "• <i>Note:</i> Large videos are split into playable parts without reducing quality.\n"
+        "• Click <b>⭐ Max Quality</b> for the highest available quality.\n\n"
         "<b>2. Downloading Playlists:</b>\n"
         "• Send <code>/playlist https://youtube.com/playlist?list=...</code>\n"
         "• The bot displays 10 videos per page with clickable checkmarks.\n"
@@ -958,12 +960,9 @@ async def handle_video_request(client: Client, message: Message, url: str):
             f"⏱️ <b>Duration:</b> {human_readable_time(analysis.duration)}\n"
         )
 
-        if analysis.excluded_qualities:
-            excluded_names = ", ".join([name for name, _ in analysis.excluded_qualities])
-            caption += f"⚠️ <i>Qualities exceeding Telegram 2 GB limit (filtered): {excluded_names}</i>\n"
-
         if analysis.max_quality:
-            caption += f"⭐ <b>Highest Quality Available (&le; 2GB):</b> {analysis.max_quality.label}\n\n"
+            caption += f"⭐ <b>Highest Quality Available:</b> {analysis.max_quality.label}\n\n"
+        caption += "📦 Large videos are split into playable parts; selected quality is preserved.\n"
         caption += "Select your desired download quality below:"
 
         keyboard = build_video_quality_keyboard(session)
@@ -1119,7 +1118,7 @@ async def callback_pl_download_prompt(client: Client, callback: CallbackQuery):
         f"📥 <b>Ready to download {count} video(s) from:</b>\n"
         f"<i>{session.playlist_title}</i>\n\n"
         f"Select download quality:\n"
-        f"<i>(Qualities > 2GB will automatically downgrade to stay within Telegram limits)</i>"
+        f"<i>(Large videos are auto-split into playable MP4 parts; quality is preserved)</i>"
     )
     keyboard = build_playlist_quality_keyboard(session_id)
     await callback.message.edit_text(text, reply_markup=keyboard)
@@ -1278,15 +1277,32 @@ async def process_single_download(
                 result = await prepare_download(status_msg, url, quality_key, max_quality_height)
             temp_dir = result.temp_dir
 
-            if isinstance(result, StreamPlan):
+            if isinstance(result, StreamPlan) or (not result.is_audio and result.file_size > video_part_limit()):
                 updater.stage = "Transferring to Telegram 📤"
+                estimate = result.estimated_size if isinstance(result, StreamPlan) else result.file_size
+                estimated_parts, _ = plan_parts(estimate, video_part_limit())
+                plan_text = (f"Estimated source: {human_readable_size(estimate)} · ~{estimated_parts} part(s)\n"
+                             if estimate else "Source size unknown; parts are limited by actual bytes.\n")
                 await status_msg.edit_text(
-                    "📤 <i>Downloading and uploading your video together...</i>\n"
-                    "The complete video will appear here when the transfer finishes.")
+                    "📤 <i>Transferring at the selected quality...</i>\n" + plan_text +
+                    f"Each part: up to {human_readable_size(video_part_limit())}.\n"
+                    "Large videos arrive as numbered playable parts, at the selected quality.")
+                current_part = 0
+
+                async def part_progress(current, total):
+                    nonlocal current_part
+                    stats = active_transfer_stats
+                    if stats.part_index != current_part:
+                        current_part = stats.part_index
+                        updater.stage = f"Transferring Part {current_part} (~{stats.part_count} total) 📤"
+                        updater.start_upload_time = 0
+                        updater.last_upload_bytes = 0
+                    await updater.async_upload_hook(current, total)
+
                 async with download_semaphore:
                     active_transfer_stats = TransferStats()
-                    await stream_video(client, chat_id, result, updater.async_upload_hook,
-                                       stats=active_transfer_stats)
+                    sender = stream_video if isinstance(result, StreamPlan) else stream_local_video
+                    await sender(client, chat_id, result, part_progress, stats=active_transfer_stats)
                 try:
                     await status_msg.delete()
                 except Exception:

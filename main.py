@@ -37,6 +37,8 @@ async def main():
     configure_crypto_workers()
     logger.info("Performance & Environment settings:")
     logger.info("  - Telegram Max File Size: %d MB", config.MAX_FILE_SIZE // (1024 * 1024))
+    logger.info("  - Original-quality video parts: at most %d MiB, bounded streaming memory",
+                min(config.VIDEO_PART_SIZE_BYTES, config.MAX_FILE_SIZE) // (1024 * 1024))
     logger.info("  - Video transfers: %s", "direct streaming (no media files on disk)"
                 if config.STREAM_VIDEO_UPLOADS else "download to disk before upload")
     logger.info("  - Telegram upload pipeline: %d connections x %d requests; %d MiB stream buffer",

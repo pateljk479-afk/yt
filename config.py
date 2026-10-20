@@ -13,10 +13,11 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # Telegram File Size Limits
-# MTProto standard max upload is 2000 MiB (~2097152000 bytes).
-# We keep a safe margin of 2000 MB (2,000,000,000 bytes) below 2 GB (2,147,483,648 bytes)
-# to guarantee uploads never exceed Telegram limits.
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(2000 * 1024 * 1024)))  # 2000 MB in bytes
+# Per-attachment ceiling, not a limit on total source video size.
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(2000 * 1024 * 1024)))
+# Playable video parts; payload streams through the bounded queue, never stored
+# as a 1700 MiB RAM object. Keep room below the Telegram attachment ceiling.
+VIDEO_PART_SIZE_BYTES = max(1, min(1700, int(os.getenv("VIDEO_PART_SIZE_MB", "1700")))) * 1024 * 1024
 
 # Download & Temporary Storage
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.abspath("./downloads"))

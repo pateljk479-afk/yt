@@ -70,7 +70,7 @@ def test_estimate_audio_size():
     assert size_calc == int((128 * 1000 / 8) * 60)
 
 
-def test_analyze_video_qualities_2gb_limit_degradation(monkeypatch):
+def test_analyze_video_qualities_preserves_oversize_4k(monkeypatch):
     monkeypatch.setattr(config, "MAX_FILE_SIZE", 2000 * 1024 * 1024)
     """
     Simulates the exact user requirement:
@@ -78,8 +78,8 @@ def test_analyze_video_qualities_2gb_limit_degradation(monkeypatch):
     2K (1440p) is available with 1.6 GB (<= 2 GB).
     1080p is available with 850 MB.
     Expectation:
-    - 4K is EXCLUDED and NOT shown in available qualities.
-    - Max / High Quality is chosen as 2K (1440p).
+    - 4K remains selectable despite its size.
+    - Max / High Quality is 4K; the sender splits large output.
     """
     # 2.3 GB = 2.3 * 1024 * 1024 * 1024 = 2,469,606,195 bytes
     size_4k = int(2.3 * 1024 * 1024 * 1024)
@@ -109,19 +109,13 @@ def test_analyze_video_qualities_2gb_limit_degradation(monkeypatch):
 
     analysis = analyze_video_qualities(mock_info)
 
-    # 1. 4K MUST be in excluded qualities
-    assert len(analysis.excluded_qualities) >= 1
-    excluded_labels = [label for label, _ in analysis.excluded_qualities]
-    assert any("4K" in l for l in excluded_labels)
-
-    # 2. 4K MUST NOT be in available qualities
+    assert analysis.excluded_qualities == []
     available_labels = [q.label for q in analysis.available_qualities]
-    assert not any("4K" in l for l in available_labels)
+    assert any("4K" in label for label in available_labels)
 
-    # 3. Max quality MUST be 2K (1440p)
     assert analysis.max_quality is not None
-    assert analysis.max_quality.height == 1440
-    assert "2K" in analysis.max_quality.label
+    assert analysis.max_quality.height == 2160
+    assert "4K" in analysis.max_quality.label
     assert analysis.max_quality.is_max is True
 
     # 4. 2K, 1080p, 720p must be present in available qualities
@@ -245,10 +239,10 @@ def test_validate_youtube_cookie_file_rejects_logged_out_export(tmp_path):
     assert "LOGIN_INFO" in validation.reason
 
 
-def test_download_media_quality_degradation_logic(monkeypatch):
+def test_disk_download_preserves_requested_quality(monkeypatch):
     monkeypatch.setattr(config, "MAX_FILE_SIZE", 2000 * 1024 * 1024)
     monkeypatch.setattr("downloader.ensure_download_space", lambda **kwargs: None)
-    """Verify format selection logic degrades when requested height exceeds 2 GB."""
+    """Selected resolution stays unchanged even when it needs multiple parts."""
     from unittest.mock import patch, MagicMock
     from downloader import download_media
 
@@ -285,9 +279,9 @@ def test_download_media_quality_degradation_logic(monkeypatch):
         mock_ydl_cls.return_value.__enter__.return_value = mock_ydl_instance
         mock_listdir.return_value = ["Super 4K Nature.mp4", "Super 4K Nature.webp"]
 
-        # Request 4K (2160), which exceeds 2 GB: should degrade to 1440 (2K)
+        # Request 4K (2160), preserving that height despite the attachment limit.
         res = download_media("https://youtube.com/watch?v=mock4k", quality_key="2160")
         assert res.title == "Super 4K Nature"
-        # Verify ydl was invoked with degraded format <= 1440
+        # The disk fallback also keeps the requested height.
         ydl_call_args = mock_ydl_cls.call_args[0][0]
-        assert "height<=1440" in ydl_call_args["format"]
+        assert "height<=2160" in ydl_call_args["format"]

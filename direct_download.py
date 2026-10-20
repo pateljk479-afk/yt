@@ -78,6 +78,9 @@ class DirectRangeRelay:
             await self.client.close()
 
     async def _probe(self, index, fmt):
+        if fmt.get("protocol") in ("m3u8", "m3u8_native"):
+            logger.info("CDN input %d: VOD HLS; FFmpeg reads segments directly", index)
+            return None
         headers = media_headers(self.plan.info, fmt)
         logger.info("CDN input %d: host=%s format=%s; probing direct byte ranges",
                     index, urlsplit(fmt["url"]).hostname, fmt.get("format_id", "unknown"))

@@ -11,7 +11,7 @@ import config
 
 
 def test_edge_case_all_qualities_exceed_2gb():
-    """If all resolutions are > 2 GB (e.g. huge long recording), none are available."""
+    """Even an enormous recording retains its quality choices for splitting."""
     huge_size = int(3 * 1024 * 1024 * 1024)  # 3 GB
     mock_info = {
         "title": "Massive 24-Hour Recording",
@@ -29,9 +29,9 @@ def test_edge_case_all_qualities_exceed_2gb():
     }
 
     analysis = analyze_video_qualities(mock_info)
-    assert len(analysis.available_qualities) == 0
-    assert analysis.max_quality is None
-    assert len(analysis.excluded_qualities) > 0
+    assert len(analysis.available_qualities) > 0
+    assert analysis.max_quality.height == 2160
+    assert analysis.excluded_qualities == []
 
 
 def test_edge_case_playlist_pagination_boundaries():

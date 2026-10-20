@@ -173,3 +173,30 @@ async def test_single_download_retains_verification_upload_and_cleanup(is_audio,
         client.send_audio.assert_not_awaited()
         client.send_video.assert_not_awaited()
     cleanup.assert_called_once_with("temp")
+
+
+@pytest.mark.asyncio
+async def test_large_disk_fallback_uses_splitter_and_resets_part_progress(monkeypatch):
+    media = SimpleNamespace(temp_dir="temp", file_path="video.mp4", is_audio=False,
+                            title="Course", duration=20, width=1280, height=720,
+                            file_size=bot.video_part_limit() + 1)
+    status, client = AsyncMock(), AsyncMock()
+
+    async def split(client, chat, result, progress, stats):
+        for index in (1, 2):
+            stats.part_index, stats.part_count = index, 2
+            await progress(0, 100)
+            await progress(50, 100)
+
+    with patch.object(bot, "prepare_download", new=AsyncMock(return_value=media)), \
+         patch.object(bot, "stream_local_video", new=AsyncMock(side_effect=split)) as sender, \
+         patch.object(bot, "safe_cleanup") as cleanup, \
+         patch("bot.time.time", side_effect=[100, 105, 110, 115]):
+        assert await bot.process_single_download(client, status, 1, "url", "1080")
+    sender.assert_awaited_once()
+    client.send_video.assert_not_awaited()
+    cleanup.assert_called_once_with("temp")
+    updates = [call.args[0] for call in status.edit_text.call_args_list]
+    assert any("Part 1" in text for text in updates)
+    assert any("Part 2" in text for text in updates)
+    assert all("-10" not in text for text in updates)

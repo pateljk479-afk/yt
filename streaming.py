@@ -14,6 +14,7 @@ import secrets
 import shutil
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -27,6 +28,7 @@ from downloader import extract_info, sanitize_filename
 from uploader import human_readable_size, human_readable_time
 from direct_download import DirectRangeRelay, media_headers
 from upload_tuning import AdaptiveUploadWindow, previous_upload_setting, remember_upload_setting
+from video_parts import FragmentedVideo, plan_parts
 
 logger = logging.getLogger(__name__)
 PART_SIZE = 512 * 1024
@@ -47,6 +49,10 @@ class StreamPlan:
 
 @dataclass
 class TransferStats:
+    part_index: int = 1
+    part_count: int = 1
+    completed_parts: int = 0
+    completed_bytes: int = 0
     ready_at: float = 0
     finished_at: float = 0
     source_bytes: int = 0
@@ -76,27 +82,27 @@ def _size(fmt, duration):
 
 
 def select_streams(info, quality_key, max_quality_height=None):
-    """Select complete HTTP resources only; never feed a manifest to FFmpeg.
+    """Keep the requested resolution; complete HTTP and VOD HLS stream directly.
 
-    Restrict protocols so FFmpeg cannot follow manifest URLs through a proxy or
-    download unbounded live streams. DASH/HLS-only sources use yt-dlp instead.
+    Fragment-list-only sources without a playable URL use the disk fallback.
+    Live input remains excluded because its final duration/size is unbounded.
     """
     if info.get("is_live") or info.get("live_status") == "is_live":
         raise UnsupportedStream("Live streams require the regular downloader")
     duration = int(info.get("duration") or 0)
-    limit = min(config.MAX_FILE_SIZE, 2000 * 1024 * 1024)
     height = (max_quality_height or 4320) if quality_key == "max" else int(quality_key)
     formats = [f for f in info.get("formats", [])
-               if f.get("protocol") in ("https", "http")
+               if f.get("protocol") in ("https", "http", "m3u8", "m3u8_native")
                and urlsplit(f.get("url", "")).scheme in ("http", "https")
-               and not f.get("fragments") and not f.get("has_drm")]
+               and (not f.get("fragments") or f.get("protocol") in ("m3u8", "m3u8_native"))
+               and not f.get("has_drm")]
     videos = sorted((f for f in formats
                      if f.get("vcodec") not in (None, "none")
-                     and f.get("ext") == "mp4" and 0 < (f.get("height") or 0) <= height),
-                    key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+                     and f.get("ext") in ("mp4", "webm") and 0 < (f.get("height") or 0) <= height),
+                    key=lambda f: (f.get("height") or 0, f.get("ext") == "mp4", f.get("tbr") or 0), reverse=True)
     audios = sorted((f for f in formats if f.get("vcodec") == "none"
-                     and f.get("acodec") not in (None, "none") and f.get("ext") == "m4a"),
-                    key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
+                     and f.get("acodec") not in (None, "none") and f.get("ext") in ("m4a", "webm")),
+                    key=lambda f: (f.get("ext") == "m4a", f.get("abr") or f.get("tbr") or 0), reverse=True)
     for video in videos:
         selected = [video]
         if video.get("acodec") in (None, "none"):
@@ -105,11 +111,9 @@ def select_streams(info, quality_key, max_quality_height=None):
             selected += [audios[0]]
         sizes = [_size(f, duration) for f in selected]
         estimate = sum(sizes)
-        # Reserve muxing overhead. Unknown sizes are checked while uploading.
-        if all(sizes) and estimate * 1.02 > limit:
-            continue
+        # Size affects the number of attachments, never the selected quality.
         return StreamPlan(info, selected, estimate)
-    raise UnsupportedStream("No suitable direct MP4 streams within the Telegram limit")
+    raise UnsupportedStream("No suitable direct MP4 streams for the selected quality")
 
 
 def prepare_stream(url, quality_key, progress_hook=None, max_quality_height=None):
@@ -131,8 +135,14 @@ def ffmpeg_command(plan, input_urls=None):
             cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in safe_headers.items())]
         cmd += ["-i", input_urls[index] if input_urls else fmt["url"]]
     cmd += ["-map", "0:v:0", "-map", "1:a:0" if len(plan.formats) > 1 else "0:a:0",
-            "-c", "copy", "-map_metadata", "-1", "-movflags",
-            "+frag_keyframe+empty_moov+default_base_moof", "-frag_duration", "2000000",
+            "-c", "copy", "-map_metadata", "-1"]
+    audio = plan.formats[-1]
+    if audio.get("protocol") in ("m3u8", "m3u8_native") and str(audio.get("acodec", "")).startswith(("mp4a", "aac")):
+        # HLS AAC carries ADTS headers. Convert container framing, not samples,
+        # before the empty MP4 moov is written (automatic filtering is too late).
+        cmd += ["-bsf:a", "aac_adtstoasc"]
+    cmd += ["-movflags",
+            "+frag_keyframe+empty_moov+default_base_moof", "-frag_size", str(8 * 1024 * 1024),
             "-f", "mp4", "pipe:1"]
     return cmd
 
@@ -164,7 +174,7 @@ async def _invoke_part(session, rpc, on_retry=None, transfer_id="-"):
 
 
 async def upload_stream(client, reader, filename, estimated_size=0, progress=None,
-                        stats=None, check_header=True):
+                        stats=None, check_header=True, max_size=None):
     """Bounded producer buffer + work-conserving pipelined Telegram requests.
 
     Every free connection slot takes the next chunk, so a slow connection cannot
@@ -189,6 +199,8 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
     pause_until = 0
     file_id = client.rnd_id()
     limit = min(config.MAX_FILE_SIZE, 2000 * 1024 * 1024)
+    if max_size is not None:
+        limit = min(limit, max_size)
     dc_id = await client.storage.dc_id()
     auth_key = await client.storage.auth_key()
     test_mode = await client.storage.test_mode()
@@ -222,7 +234,7 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                 logger.info("Transfer %s first source bytes after %.2fs", stats.transfer_id,
                             time.monotonic() - stats.ready_at)
             if stats.source_bytes > limit:
-                raise ValueError("Stream exceeds the Telegram file size limit; choose a lower quality.")
+                raise ValueError("Stream exceeds the attachment size limit; video splitting is required.")
             await queue.put((chunk, eof))
             stats.buffered_bytes = queue.qsize() * PART_SIZE
             stats.peak_buffered_bytes = max(stats.peak_buffered_bytes, stats.buffered_bytes)
@@ -448,66 +460,139 @@ async def stream_video(client, chat_id, plan, progress=None, stats=None):
     logger.info("Transfer %s preparing MP4: height=%s; inputs=%d; estimated=%d bytes",
                 stats.transfer_id, plan.formats[0].get("height"), len(plan.formats), plan.estimated_size)
     async with DirectRangeRelay(plan) as relay:
+        if len(relay.routes) == len(plan.formats):
+            exact = sum(route["size"] for route in relay.routes.values())
+            logger.info("Transfer %s exact CDN input size=%d bytes (metadata estimate=%d)",
+                        stats.transfer_id, exact, plan.estimated_size)
+            plan.estimated_size = exact
         return await _stream_video(client, chat_id, plan, relay, progress, stats)
 
 
-async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None):
-    """Publish only after FFmpeg exits successfully and all chunks are saved."""
+async def stream_local_video(client, chat_id, result, progress=None, stats=None):
+    """Split a disk-fallback result through the same bounded MP4/MTProto path."""
+    plan = StreamPlan({"title": result.title, "duration": result.duration},
+                      [{"width": result.width, "height": result.height}], result.file_size)
+    relay = SimpleNamespace(failure=None, network_bytes=0, urls=None)
+    return await _stream_video(client, chat_id, plan, relay, progress, stats, local_path=result.file_path)
+
+
+def video_part_limit():
+    return min(config.VIDEO_PART_SIZE_BYTES, config.MAX_FILE_SIZE, 2000 * 1024 * 1024)
+
+
+async def _publish_video_part(client, chat_id, plan, file, filename, size, duration,
+                              start=0, index=None):
+    """A stable SendMedia random_id prevents duplicate posts after timeouts."""
+    info, video = plan.info, plan.formats[0]
+    thumb = await _thumbnail(client, info.get("thumbnail"))
+    title = html.escape(str(info.get("title", "Video")))
+    caption = f"🎬 <b>{title}</b>"
+    if index is not None:
+        caption += (f"\n📦 <b>Part {index}</b> · Original quality\n"
+                    f"🕒 {human_readable_time(int(start))} – {human_readable_time(math.ceil(start + duration))}")
+    caption += (f"\n\n⏱️ <b>Duration:</b> {human_readable_time(math.ceil(duration))}\n"
+                f"💾 <b>Size:</b> {human_readable_size(size)}")
+    media = raw.types.InputMediaUploadedDocument(
+        file=file, mime_type="video/mp4", thumb=thumb,
+        attributes=[raw.types.DocumentAttributeVideo(
+            duration=math.ceil(duration), w=int(video.get("width") or 0),
+            h=int(video.get("height") or 0), supports_streaming=True),
+            raw.types.DocumentAttributeFilename(file_name=filename)])
+    parsed = await client.parser.parse(caption, enums.ParseMode.HTML)
+    request = raw.functions.messages.SendMedia(
+        peer=await client.resolve_peer(chat_id), media=media, random_id=client.rnd_id(),
+        message=parsed["message"], entities=parsed["entities"])
+    for attempt in range(3):
+        try:
+            return await client.invoke(request)
+        except FloodWait as exc:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(exc.value)
+        except (OSError, asyncio.TimeoutError, InternalServerError):
+            if attempt == 2:
+                raise
+            await asyncio.sleep(2 * (attempt + 1))
+
+
+async def _validate_video_end(process, errors, relay, expected):
+    code = await asyncio.wait_for(process.wait(), 30)
+    diagnostics = await errors
+    logger.info("FFmpeg exited=%d; CDN bytes=%d", code, relay.network_bytes)
+    if relay.failure:
+        raise relay.failure
+    if code:
+        raise RuntimeError("Direct video transfer failed in FFmpeg. Check CDN access or retry the video.")
+    durations = re.findall(rb"out_time_us=(\d+)", diagnostics)
+    actual = int(durations[-1]) / 1_000_000 if durations else 0
+    if b"progress=end" not in diagnostics or (expected and actual < expected - max(5, expected * 0.02)):
+        raise ValueError("The video stream ended early; retry this video. The final part was not sent.")
+
+
+async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None, local_path=None):
+    """One FFmpeg pass; publish bounded playable parts as they are acknowledged."""
+    stats = stats or TransferStats(transfer_id=secrets.token_hex(4))
     info = plan.info
-    filename = sanitize_filename(info.get("title", "video")) + ".mp4"
+    base = sanitize_filename(info.get("title", "video"))
+    limit = video_part_limit()
+    count, target = plan_parts(plan.estimated_size, limit)
+    logger.info("Transfer %s split plan: estimate=%d bytes, estimated parts=%d, target=%d, "
+                "hard limit=%d bytes; quality=%sp preserved; keyframe cuts, no staging",
+                stats.transfer_id, plan.estimated_size, count, target, limit, plan.formats[0].get("height"))
     env = {k: v for k, v in os.environ.items()
            if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
     logger.info("Streaming route: server direct CDN -> FFmpeg -> Telegram; no media files on disk")
+    command = ffmpeg_command(plan, relay.urls) if local_path is None else [
+        shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-nostats", "-progress", "pipe:2", "-i", local_path, "-map", "0:v:0", "-map", "0:a:0?",
+        "-c", "copy", "-map_metadata", "-1", "-movflags",
+        "+frag_keyframe+empty_moov+default_base_moof", "-frag_size", str(8 * 1024 * 1024),
+        "-f", "mp4", "pipe:1"]
     process = await asyncio.create_subprocess_exec(
-        *ffmpeg_command(plan, relay.urls), stdout=asyncio.subprocess.PIPE,
+        *command, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, env=env, limit=PART_SIZE * 2)
     errors = asyncio.create_task(_stderr_tail(process.stderr))
+    sent_count = total_size = 0
+    root_id = stats.transfer_id
     try:
-        file, size = await upload_stream(client, process.stdout, filename, plan.estimated_size, progress, stats)
-        code = await asyncio.wait_for(process.wait(), 30)
-        diagnostics = await errors
-        logger.info("Transfer %s FFmpeg exited=%d; CDN bytes=%d; output=%d bytes",
-                    stats.transfer_id, code, relay.network_bytes, size)
-        if relay.failure:
-            raise relay.failure
-        if code:
-            # FFmpeg stderr can contain signed CDN URLs and cookies. Do not echo it.
-            raise RuntimeError("Direct video transfer failed in FFmpeg. Check CDN access or retry the video.")
-        durations = re.findall(rb"out_time_us=(\d+)", diagnostics)
-        expected = float(info.get("duration") or 0)
-        actual = int(durations[-1]) / 1_000_000 if durations else 0
-        if b"progress=end" not in diagnostics or (expected and actual < expected - max(5, expected * 0.02)):
-            raise ValueError("The video stream ended early; retry this video. It was not sent to the chat.")
-        thumb = await _thumbnail(client, info.get("thumbnail"))
-        video = plan.formats[0]
-        title = html.escape(str(info.get("title", "Video")))
-        caption = (f"🎬 <b>{title}</b>\n\n"
-                   f"⏱️ <b>Duration:</b> {human_readable_time(int(info.get('duration') or 0))}\n"
-                   f"💾 <b>Size:</b> {human_readable_size(size)}")
-        media = raw.types.InputMediaUploadedDocument(
-            file=file, mime_type="video/mp4", thumb=thumb,
-            attributes=[raw.types.DocumentAttributeVideo(
-                duration=int(info.get("duration") or 0), w=int(video.get("width") or 0),
-                h=int(video.get("height") or 0), supports_streaming=True),
-                raw.types.DocumentAttributeFilename(file_name=filename)])
-        parsed = await client.parser.parse(caption, enums.ParseMode.HTML)
-        request = raw.functions.messages.SendMedia(
-            peer=await client.resolve_peer(chat_id), media=media, random_id=client.rnd_id(),
-            message=parsed["message"], entities=parsed["entities"])
-        # Reuse random_id on a timeout so a retried send cannot post duplicates.
-        for attempt in range(3):
-            try:
-                sent = await client.invoke(request)
-                logger.info("Transfer %s published to Telegram", stats.transfer_id)
-                return sent
-            except FloodWait as exc:
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(exc.value)
-            except (OSError, asyncio.TimeoutError, InternalServerError):
-                if attempt == 2:
-                    raise
-                await asyncio.sleep(2 * (attempt + 1))
+        source = await asyncio.wait_for(FragmentedVideo(process.stdout, limit, plan.estimated_size).start(),
+                                        config.STREAM_READ_TIMEOUT)
+        while (part := source.next_part()) is not None:
+            filename = f"{base}_part_{part.index:02d}.mp4"
+            # Preserve the stats object observed by /speedtest while resetting
+            # per-attachment ACK and source counters for the uploader.
+            stats.__dict__.update(TransferStats(
+                transfer_id=f"{root_id}-p{part.index}", part_index=part.index,
+                part_count=max(count, part.index), completed_parts=sent_count,
+                completed_bytes=total_size).__dict__)
+            logger.info("Transfer %s part %d starting; estimated count=%d, target=%d bytes",
+                        root_id, part.index, count, target)
+            file, size = await upload_stream(client, part, filename, target, progress, stats, max_size=limit)
+            if relay.failure:
+                raise relay.failure
+            if source.eof:
+                await _validate_video_end(process, errors, relay, float(info.get("duration") or 0))
+            single = part.index == 1 and source.eof
+            if single:
+                filename = base + ".mp4"
+                file.name = filename
+            sent = await _publish_video_part(client, chat_id, plan, file, filename, size,
+                                             part.duration, part.start, None if single else part.index)
+            sent_count += 1
+            total_size += size
+            stats.completed_parts, stats.completed_bytes = sent_count, total_size
+            logger.info("Transfer %s part %d published: %d bytes, timeline=%.3f..%.3fs; "
+                        "total published=%d bytes", root_id, part.index, size, part.start, part.end, total_size)
+        if not sent_count:
+            raise ValueError("No complete video parts were produced")
+        logger.info("Transfer %s complete: %d playable parts, %d bytes; original quality preserved",
+                    root_id, sent_count, total_size)
+        return sent
+    except Exception as exc:
+        if sent_count:
+            raise RuntimeError(f"Transfer stopped after {sent_count} part(s) were delivered. "
+                               "Those parts remain available; later parts are incomplete. Retry the video.") from exc
+        raise
     finally:
         if process.returncode is None:
             try:
