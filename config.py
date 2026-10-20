@@ -45,6 +45,12 @@ CRYPTO_WORKERS = max(1, min(8, int(os.getenv("CRYPTO_WORKERS", "4"))))
 UPLOAD_TUNE_INTERVAL = max(5, float(os.getenv("UPLOAD_TUNE_INTERVAL", "5")))
 UPLOAD_RECOVERY_SECONDS = max(10, float(os.getenv("UPLOAD_RECOVERY_SECONDS", "30")))
 PYROGRAM_WAIT_TIMEOUT = int(os.getenv("PYROGRAM_WAIT_TIMEOUT", "60"))
+# Each external stage has an explicit deadline; every retryable stage gets
+# the initial attempt and two retries, with no hidden Pyrogram retry loop.
+TRANSFER_STAGE_TIMEOUT = max(10, float(os.getenv("TRANSFER_STAGE_TIMEOUT", "60")))
+TRANSFER_CLEANUP_TIMEOUT = max(2, float(os.getenv("TRANSFER_CLEANUP_TIMEOUT", "10")))
+TRANSFER_STATUS_TIMEOUT = max(2, float(os.getenv("TRANSFER_STATUS_TIMEOUT", "10")))
+THUMBNAIL_TIMEOUT = max(5, float(os.getenv("THUMBNAIL_TIMEOUT", "20")))
 PREFETCH_PLAYLIST = os.getenv("PREFETCH_PLAYLIST", "false").lower() in ("true", "1", "yes")
 # Stream MP4 output directly into Telegram instead of storing input + merged copies.
 STREAM_VIDEO_UPLOADS = os.getenv("STREAM_VIDEO_UPLOADS", "true").lower() in ("true", "1", "yes")

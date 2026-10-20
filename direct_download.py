@@ -12,6 +12,7 @@ from aiohttp import web
 from yarl import URL
 
 import config
+from transfer_runtime import bounded
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +73,14 @@ class DirectRangeRelay:
             raise
 
     async def __aexit__(self, *args):
-        if self.runner:
-            await self.runner.cleanup()
-        if self.client:
-            await self.client.close()
+        try:
+            if self.runner:
+                await bounded(self.runner.cleanup(), config.TRANSFER_CLEANUP_TIMEOUT, "CDN relay cleanup")
+        except Exception:
+            logger.warning("CDN relay cleanup failed", exc_info=True)
+        finally:
+            if self.client:
+                await bounded(self.client.close(), config.TRANSFER_CLEANUP_TIMEOUT, "CDN client cleanup")
 
     async def _probe(self, index, fmt):
         if fmt.get("protocol") in ("m3u8", "m3u8_native"):

@@ -46,6 +46,9 @@ async def main():
                 config.STREAM_BUFFER_BYTES // (1024 * 1024))
     logger.info("  - Adaptive upload: %s; ceiling %d connections x %d ordered request",
                 config.UPLOAD_ADAPTIVE, config.UPLOAD_MAX_WORKERS, config.UPLOAD_MAX_REQUESTS_PER_CONNECTION)
+    logger.info("  - Transfer recovery: 2 retries; stage %.0fs; cleanup %.0fs; status %.0fs; thumbnail %.0fs",
+                config.TRANSFER_STAGE_TIMEOUT, config.TRANSFER_CLEANUP_TIMEOUT,
+                config.TRANSFER_STATUS_TIMEOUT, config.THUMBNAIL_TIMEOUT)
     logger.info("  - Max Concurrent Downloads: %d", config.MAX_CONCURRENT_DOWNLOADS)
     logger.info("  - Fragment Parallel Streams: %d", config.CONCURRENT_FRAGMENT_DOWNLOADS)
     logger.info("  - aria2c Accelerated Downloader: %s", "Enabled" if config.ARIA2C_AVAILABLE else "Disabled (yt-dlp native multithread)")

@@ -13,7 +13,7 @@ import re
 import secrets
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -29,6 +29,8 @@ from uploader import human_readable_size, human_readable_time
 from direct_download import DirectRangeRelay, media_headers
 from upload_tuning import AdaptiveUploadWindow, previous_upload_setting, remember_upload_setting
 from video_parts import FragmentedVideo, plan_parts
+from transfer_runtime import (bounded, retry_stage, close_media_sessions,
+                              TransferStageError)
 
 logger = logging.getLogger(__name__)
 PART_SIZE = 512 * 1024
@@ -46,6 +48,15 @@ class StreamPlan:
     # Matches the playlist's cleanup contract; streamed videos own no disk files.
     temp_dir: str = None
     output_quality: str = ""
+
+
+@dataclass
+class DeliveryCheckpoint:
+    # Retries recreate the same stream, discard ACKed parts without uploading
+    # them again, and check the original part boundaries before continuing.
+    parts: list = field(default_factory=list)
+    last_sent: object = None
+    estimate: int = 0
 
 
 @dataclass
@@ -149,12 +160,13 @@ def ffmpeg_command(plan, input_urls=None):
 
 
 async def _invoke_part(session, rpc, on_retry=None, transfer_id="-"):
-    for attempt in range(5):
+    for attempt in range(3):
         try:
             # Surface throttling/retries to our controller instead of hiding
             # them inside Pyrogram's own retry and FloodWait loops.
-            response = await session.invoke(rpc, retries=0, sleep_threshold=0,
-                                            timeout=config.PYROGRAM_WAIT_TIMEOUT)
+            response = await bounded(session.invoke(rpc, retries=0, sleep_threshold=0,
+                                                    timeout=config.PYROGRAM_WAIT_TIMEOUT),
+                                     config.TRANSFER_STAGE_TIMEOUT, "Telegram upload chunk")
             # Pyrogram returns BadMsgNotification instead of raising it.  It
             # is not an acknowledgement that Telegram saved the part, so do
             # not count it as success or finalize a damaged document/video.
@@ -168,16 +180,16 @@ async def _invoke_part(session, rpc, on_retry=None, transfer_id="-"):
         except FloodWait as exc:
             if on_retry:
                 on_retry("throttle", exc.value)
-            if attempt == 4:
-                raise
+            if attempt == 2 or exc.value > config.TRANSFER_STAGE_TIMEOUT:
+                raise TransferStageError(f"Telegram upload throttled for {exc.value}s; retry budget exhausted") from exc
             logger.warning("Transfer %s Telegram chunk %d waiting %ds (FloodWait)", transfer_id, rpc.file_part, exc.value)
             await asyncio.sleep(exc.value)
-        except (OSError, KeyError, asyncio.TimeoutError, InternalServerError) as exc:
+        except Exception as exc:
             if on_retry:
                 on_retry("network", 0)
-            if attempt == 4:
-                raise
-            logger.warning("Transfer %s Telegram chunk %d retry %d/5 after %s",
+            if attempt == 2:
+                raise TransferStageError("Telegram upload chunk failed after two retries") from exc
+            logger.warning("Transfer %s Telegram chunk %d retry %d/2 after %s",
                            transfer_id, rpc.file_part, attempt + 1, type(exc).__name__)
             await asyncio.sleep(0.5 * (attempt + 1))
 
@@ -265,7 +277,7 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
             stats.upload_bps = (stats.uploaded_bytes - previous_upload) / elapsed
             stats.sampled_at = now
             previous_time, previous_source, previous_upload = now, stats.source_bytes, stats.uploaded_bytes
-            stats.wait_stage = "Telegram" if stats.buffered_bytes or stats.in_flight >= control.capacity else "source"
+            stats.wait_stage = "Telegram" if stats.buffered_bytes or stats.in_flight else "source"
             logger.info("Transfer %s feed=%.1f KiB/s Telegram=%.1f KiB/s; produced=%d acked=%d; "
                         "buffer=%.1f MiB; active=%d; in-flight=%d/%d; retries=%d throttles=%d; waiting=%s",
                         stats.transfer_id, stats.source_bps / 1024, stats.upload_bps / 1024,
@@ -329,7 +341,9 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
         for _ in range(pool_size):
             session = Session(client, dc_id, auth_key, test_mode, is_media=True)
             sessions.append(session)
-        starts = await asyncio.gather(*(s.start() for s in sessions), return_exceptions=True)
+        starts = await asyncio.gather(*(bounded(s.start(), config.TRANSFER_STAGE_TIMEOUT,
+                                               "Telegram media session startup") for s in sessions),
+                                      return_exceptions=True)
         for result in starts:
             if isinstance(result, BaseException):
                 raise result
@@ -388,7 +402,12 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                 await drain(one=True)
             while pause_until > time.monotonic():
                 await asyncio.sleep(pause_until - time.monotonic())
-            index = min(range(control.workers), key=lambda i: loads[i])
+            # When the controller shrinks the active pool, requests on the
+            # disabled sessions may still be draining. Never reuse a busy
+            # active Session even if the global pending count is below capacity.
+            while not any(loads[i] == 0 for i in range(control.workers)):
+                await drain(one=True)
+            index = next(i for i in range(control.workers) if loads[i] == 0)
             loads[index] += 1
             pending[asyncio.create_task(send(index, rpc))] = index
             stats.in_flight = len(pending)
@@ -404,7 +423,7 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         stats.in_flight = stats.buffered_bytes = 0
-        await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
+        await close_media_sessions(sessions, "Transfer " + stats.transfer_id)
         logger.info("Transfer %s cleanup complete: %d sessions closed", stats.transfer_id, len(sessions))
 
 
@@ -436,6 +455,14 @@ async def _stderr_tail(reader):
 
 
 async def _thumbnail(client, url):
+    try:
+        return await bounded(_prepare_thumbnail(client, url), config.THUMBNAIL_TIMEOUT, "Video thumbnail")
+    except Exception:
+        logger.warning("Thumbnail unavailable or timed out; publishing without it", exc_info=True)
+        return None
+
+
+async def _prepare_thumbnail(client, url):
     if not url or urlsplit(url).scheme not in ("http", "https"):
         return None
     try:
@@ -472,13 +499,15 @@ async def stream_video(client, chat_id, plan, progress=None, stats=None):
     stats.transfer_id = stats.transfer_id or secrets.token_hex(4)
     logger.info("Transfer %s preparing MP4: height=%s; inputs=%d; estimated=%d bytes",
                 stats.transfer_id, plan.formats[0].get("height"), len(plan.formats), plan.estimated_size)
-    async with DirectRangeRelay(plan) as relay:
-        if len(relay.routes) == len(plan.formats):
-            exact = sum(route["size"] for route in relay.routes.values())
-            logger.info("Transfer %s exact CDN input size=%d bytes (metadata estimate=%d)",
-                        stats.transfer_id, exact, plan.estimated_size)
-            plan.estimated_size = exact
-        return await _stream_video(client, chat_id, plan, relay, progress, stats)
+    async def run(checkpoint):
+        async with DirectRangeRelay(plan) as relay:
+            if len(relay.routes) == len(plan.formats):
+                exact = sum(route["size"] for route in relay.routes.values())
+                logger.info("Transfer %s exact CDN input size=%d bytes (metadata estimate=%d)",
+                            stats.transfer_id, exact, plan.estimated_size)
+                plan.estimated_size = exact
+            return await _stream_video(client, chat_id, plan, relay, progress, stats, checkpoint=checkpoint)
+    return await _retry_video(run, stats, progress)
 
 
 async def stream_local_video(client, chat_id, result, progress=None, stats=None):
@@ -486,8 +515,39 @@ async def stream_local_video(client, chat_id, result, progress=None, stats=None)
     plan = StreamPlan({"title": result.title, "duration": result.duration},
                       [{"width": result.width, "height": result.height}], result.file_size,
                       output_quality=getattr(result, "output_quality", ""))
-    relay = SimpleNamespace(failure=None, network_bytes=0, urls=None)
-    return await _stream_video(client, chat_id, plan, relay, progress, stats, local_path=result.file_path)
+    stats = stats or TransferStats(transfer_id=secrets.token_hex(4))
+    stats.transfer_id = stats.transfer_id or secrets.token_hex(4)
+    async def run(checkpoint):
+        relay = SimpleNamespace(failure=None, network_bytes=0, urls=None)
+        return await _stream_video(client, chat_id, plan, relay, progress, stats,
+                                   local_path=result.file_path, checkpoint=checkpoint)
+    return await _retry_video(run, stats, progress)
+
+
+async def _retry_video(run, stats, progress=None):
+    """Recover source/FFmpeg failures twice, retaining confirmed deliveries."""
+    checkpoint = DeliveryCheckpoint()
+    root_id = stats.transfer_id
+    for attempt in range(3):
+        try:
+            stats.transfer_id = root_id
+            return await run(checkpoint)
+        except TransferStageError:
+            # The failing network stage already spent its two retries.
+            raise
+        except Exception as exc:
+            if attempt == 2:
+                raise
+            logger.warning("Transfer %s source/processing retry=%d/2; confirmed parts=%d; reason=%s: %s",
+                           stats.transfer_id, attempt + 1, len(checkpoint.parts), type(exc).__name__, exc)
+            stats.wait_stage = f"Retrying source ({attempt + 1}/2)"
+            if progress:
+                try:
+                    await bounded(progress(stats.uploaded_bytes, max(1, stats.source_bytes)),
+                                  config.TRANSFER_STATUS_TIMEOUT, "Source retry status")
+                except Exception:
+                    logger.debug("Source retry status unavailable", exc_info=True)
+            await asyncio.sleep(2 * (attempt + 1))
 
 
 def video_part_limit():
@@ -514,26 +574,23 @@ async def _publish_video_part(client, chat_id, plan, file, filename, size, durat
             duration=math.ceil(duration), w=int(video.get("width") or 0),
             h=int(video.get("height") or 0), supports_streaming=True),
             raw.types.DocumentAttributeFilename(file_name=filename)])
-    parsed = await client.parser.parse(caption, enums.ParseMode.HTML)
+    parsed = await bounded(client.parser.parse(caption, enums.ParseMode.HTML),
+                           config.TRANSFER_STAGE_TIMEOUT, "Media caption")
+    peer = await retry_stage("Resolve Telegram peer", lambda: client.resolve_peer(chat_id),
+                             config.TRANSFER_STAGE_TIMEOUT)
     request = raw.functions.messages.SendMedia(
-        peer=await client.resolve_peer(chat_id), media=media, random_id=client.rnd_id(),
+        peer=peer, media=media, random_id=client.rnd_id(),
         message=parsed["message"], entities=parsed["entities"])
-    for attempt in range(3):
-        try:
-            return await client.invoke(request)
-        except FloodWait as exc:
-            if attempt == 2:
-                raise
-            await asyncio.sleep(exc.value)
-        except (OSError, asyncio.TimeoutError, InternalServerError):
-            if attempt == 2:
-                raise
-            await asyncio.sleep(2 * (attempt + 1))
+    # Keep exactly this request (including random_id and uploaded file) for all
+    # attempts. A lost response must not cause a fresh upload or duplicate post.
+    return await retry_stage(f"Publish {filename}", lambda: client.invoke(
+        request, retries=0, timeout=config.TRANSFER_STAGE_TIMEOUT, sleep_threshold=0),
+        config.TRANSFER_STAGE_TIMEOUT)
 
 
 async def _validate_video_end(process, errors, relay, expected):
     code = await asyncio.wait_for(process.wait(), 30)
-    diagnostics = await errors
+    diagnostics = await bounded(errors, config.TRANSFER_CLEANUP_TIMEOUT, "FFmpeg diagnostics")
     logger.info("FFmpeg exited=%d; CDN bytes=%d", code, relay.network_bytes)
     if relay.failure:
         raise relay.failure
@@ -545,7 +602,7 @@ async def _validate_video_end(process, errors, relay, expected):
         raise ValueError("The video stream ended early; retry this video. The final part was not sent.")
 
 
-async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None, local_path=None):
+async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None, local_path=None, checkpoint=None):
     """One FFmpeg pass; publish bounded playable parts as they are acknowledged."""
     stats = stats or TransferStats(transfer_id=secrets.token_hex(4))
     info = plan.info
@@ -553,7 +610,11 @@ async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None,
     if plan.output_quality:
         base += "_" + plan.output_quality
     limit = video_part_limit()
-    count, target = plan_parts(plan.estimated_size, limit)
+    checkpoint = checkpoint or DeliveryCheckpoint()
+    if not checkpoint.parts:
+        checkpoint.estimate = plan.estimated_size
+    estimate = checkpoint.estimate
+    count, target = plan_parts(estimate, limit)
     logger.info("Transfer %s split plan: estimate=%d bytes, estimated parts=%d, target=%d, "
                 "hard limit=%d bytes; quality=%sp preserved; keyframe cuts, no staging",
                 stats.transfer_id, plan.estimated_size, count, target, limit, plan.formats[0].get("height"))
@@ -566,16 +627,36 @@ async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None,
         "-c", "copy", "-map_metadata", "-1", "-movflags",
         "+frag_keyframe+empty_moov+default_base_moof", "-frag_size", str(8 * 1024 * 1024),
         "-f", "mp4", "pipe:1"]
-    process = await asyncio.create_subprocess_exec(
+    process = await bounded(asyncio.create_subprocess_exec(
         *command, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE, env=env, limit=PART_SIZE * 2)
+        stderr=asyncio.subprocess.PIPE, env=env, limit=PART_SIZE * 2),
+        config.TRANSFER_STAGE_TIMEOUT, "FFmpeg startup")
     errors = asyncio.create_task(_stderr_tail(process.stderr))
-    sent_count = total_size = 0
+    sent_count = len(checkpoint.parts)
+    total_size = sum(item[0] for item in checkpoint.parts)
+    sent = checkpoint.last_sent
     root_id = stats.transfer_id
     try:
-        source = await asyncio.wait_for(FragmentedVideo(process.stdout, limit, plan.estimated_size).start(),
+        source = await asyncio.wait_for(FragmentedVideo(process.stdout, limit, estimate).start(),
                                         config.STREAM_READ_TIMEOUT)
         while (part := source.next_part()) is not None:
+            if part.index <= len(checkpoint.parts):
+                # Recreate stream boundaries without storing or uploading the
+                # already delivered bytes. Abort if the source changed.
+                discarded = 0
+                while True:
+                    try:
+                        block = await bounded(part.readexactly(PART_SIZE), config.STREAM_READ_TIMEOUT,
+                                              "Replay confirmed video part")
+                        discarded += len(block)
+                    except asyncio.IncompleteReadError as exc:
+                        discarded += len(exc.partial)
+                        break
+                previous = checkpoint.parts[part.index - 1]
+                if previous != (discarded, part.start, part.end):
+                    raise TransferStageError("Source changed on retry; refusing to duplicate or skip video content")
+                logger.info("Transfer %s replayed confirmed part %d; no upload or duplicate post", root_id, part.index)
+                continue
             filename = f"{base}_part_{part.index:02d}.mp4"
             # Preserve the stats object observed by /speedtest while resetting
             # per-attachment ACK and source counters for the uploader.
@@ -589,13 +670,23 @@ async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None,
             if relay.failure:
                 raise relay.failure
             if source.eof:
+                stats.wait_stage = "Verifying final part"
                 await _validate_video_end(process, errors, relay, float(info.get("duration") or 0))
             single = part.index == 1 and source.eof
             if single:
                 filename = base + ".mp4"
                 file.name = filename
+            stats.wait_stage = "Publishing to Telegram"
+            if progress:
+                try:
+                    await bounded(progress(size, size), config.TRANSFER_STATUS_TIMEOUT, "Publishing status")
+                except Exception:
+                    logger.debug("Publishing status unavailable", exc_info=True)
+            logger.info("Transfer %s publishing part %d; uploaded=%d bytes", root_id, part.index, size)
             sent = await _publish_video_part(client, chat_id, plan, file, filename, size,
                                              part.duration, part.start, None if single else part.index)
+            checkpoint.parts.append((size, part.start, part.end))
+            checkpoint.last_sent = sent
             sent_count += 1
             total_size += size
             stats.completed_parts, stats.completed_bytes = sent_count, total_size
@@ -608,8 +699,9 @@ async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None,
         return sent
     except Exception as exc:
         if sent_count:
-            raise RuntimeError(f"Transfer stopped after {sent_count} part(s) were delivered. "
-                               "Those parts remain available; later parts are incomplete. Retry the video.") from exc
+            error = TransferStageError if isinstance(exc, TransferStageError) else RuntimeError
+            raise error(f"Transfer stopped after {sent_count} part(s) were delivered. "
+                        "Those parts remain available; later parts are incomplete. " + str(exc)) from exc
         raise
     finally:
         if process.returncode is None:
@@ -619,7 +711,13 @@ async def _stream_video(client, chat_id, plan, relay, progress=None, stats=None,
                 pass
         # Drain stdout even after an upload error/cancellation so a full pipe
         # cannot prevent subprocess transport shutdown.
-        while await process.stdout.read(64 * 1024):
-            pass
-        await process.wait()
-        await asyncio.gather(errors, return_exceptions=True)
+        async def reap():
+            while await process.stdout.read(64 * 1024):
+                pass
+            await process.wait()
+            await asyncio.gather(errors, return_exceptions=True)
+        try:
+            await bounded(reap(), config.TRANSFER_CLEANUP_TIMEOUT, "FFmpeg cleanup")
+        except Exception:
+            errors.cancel()
+            logger.warning("Transfer %s FFmpeg cleanup timed out", root_id, exc_info=True)

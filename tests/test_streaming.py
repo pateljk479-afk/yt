@@ -741,6 +741,8 @@ async def test_real_split_parts_preserve_frames_audio_and_independent_playback(
 
 @pytest.mark.asyncio
 async def test_later_delivery_failure_reports_previously_sent_part(tmp_path, monkeypatch, telegram):
+    import transfer_runtime
+    monkeypatch.setattr(transfer_runtime, "RETRY_BACKOFF", 0)
     ffmpeg = ffmpeg_executable()
     source = tmp_path / "course.mp4"
     subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
@@ -752,13 +754,60 @@ async def test_later_delivery_failure_reports_previously_sent_part(tmp_path, mon
     result = SimpleNamespace(file_path=str(source), title="Course", duration=5,
                              width=320, height=240, file_size=source.stat().st_size)
     client, stats = fake_client(), streaming.TransferStats()
-    client.invoke.side_effect = [object(), RuntimeError("SendMedia failed")]
+    client.invoke.side_effect = [object()] + [RuntimeError("SendMedia failed")] * 3
     with pytest.raises(RuntimeError, match=r"after 1 part\(s\) were delivered"):
         await streaming.stream_local_video(client, 1, result, stats=stats)
     assert stats.completed_parts == 1
-    assert client.invoke.await_count == 2
+    assert client.invoke.await_count == 4  # First part + three attempts for part 2.
+    failed_requests = [call.args[0] for call in client.invoke.call_args_list[1:]]
+    assert all(request is failed_requests[0] for request in failed_requests)
     first = client.invoke.call_args_list[0].args[0]
     assert first.media.attributes[1].file_name == "Course_part_01.mp4"
+    assert all(session.stop.await_count == 1 for session in telegram[1])
+
+
+@pytest.mark.asyncio
+async def test_source_retry_replays_delivered_parts_without_duplicates_or_frame_loss(tmp_path, monkeypatch, telegram):
+    ffmpeg = ffmpeg_executable()
+    source = tmp_path / "recovery.mp4"
+    subprocess.run([ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=320x240:rate=25:duration=5", "-f", "lavfi", "-i",
+                    "sine=duration=5", "-c:v", "libx264", "-g", "25", "-sc_threshold", "0",
+                    "-c:a", "aac", "-shortest", str(source)], check=True, capture_output=True)
+    monkeypatch.setattr(streaming.shutil, "which", lambda _: ffmpeg)
+    monkeypatch.setattr(config, "VIDEO_PART_SIZE_BYTES", 80_000)
+    result = SimpleNamespace(file_path=str(source), title="Course", duration=5,
+                             width=320, height=240, file_size=source.stat().st_size)
+    original_upload = streaming.upload_stream
+    failed = False
+    async def interrupt_once(client, part, *args, **kwargs):
+        nonlocal failed
+        if part.index == 2 and not failed:
+            failed = True
+            raise OSError("source transport broke")
+        return await original_upload(client, part, *args, **kwargs)
+    monkeypatch.setattr(streaming, "upload_stream", interrupt_once)
+    client, stats = fake_client(), streaming.TransferStats()
+    await asyncio.wait_for(streaming.stream_local_video(client, 1, result, stats=stats), 15)
+    requests = [call.args[0] for call in client.invoke.call_args_list]
+    filenames = [request.media.attributes[1].file_name for request in requests]
+    assert len(requests) >= 3 and len(set(filenames)) == len(requests)
+    assert stats.completed_parts == len(requests)
+    decoded_frames = []
+    for index, request in enumerate(requests, 1):
+        assert filenames[index - 1] == f"Course_part_{index:02d}.mp4"
+        uploaded = [rpc for rpc in telegram[0] if rpc.file_id == request.media.file.id]
+        output = tmp_path / f"delivered-{index}.mp4"
+        output.write_bytes(b"".join(rpc.bytes for rpc in sorted(uploaded, key=lambda rpc: rpc.file_part)))
+        frames = subprocess.run([ffmpeg, "-v", "error", "-xerror", "-i", str(output),
+                                 "-map", "0:v", "-f", "framemd5", "-"], check=True, capture_output=True).stdout.decode()
+        decoded_frames.extend(line.split(",")[-1].strip() for line in frames.splitlines()
+                              if line and not line.startswith("#"))
+    frames = subprocess.run([ffmpeg, "-v", "error", "-i", str(source), "-map", "0:v",
+                             "-f", "framemd5", "-"], check=True, capture_output=True).stdout.decode()
+    original_frames = [line.split(",")[-1].strip() for line in frames.splitlines()
+                       if line and not line.startswith("#")]
+    assert decoded_frames == original_frames
     assert all(session.stop.await_count == 1 for session in telegram[1])
 
 

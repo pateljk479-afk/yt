@@ -285,7 +285,12 @@ timeline range in captions. Small videos retain their original filename. Logs
 record the initial plan and each part's byte count, time range and publication.
 Progress resets its byte/speed counters for each numbered part. If a later part
 fails, already sent parts stay available and the error reports the partial
-delivery; restart-resume of unsent parts is not implemented.
+delivery. Within the running job, source/FFmpeg failures get two automatic
+retries. The stream is reconstructed from the start with bounded memory;
+confirmed parts are read and discarded rather than uploaded or posted again.
+The original size plan and part boundaries are checked before continuing.
+This can require re-downloading earlier bytes; it does not require staging a
+full file. Recovery across a bot restart is not implemented.
 
 The splitter rejects malformed/truncated fragments and never publishes a
 part that starts without a keyframe. The last part additionally requires a
@@ -331,11 +336,33 @@ Free connection slots take the next chunk; slow connections do not hold up
 healthy ones. Sessions start concurrently, and status edits run outside the
 data path. These buffers plus CDN ranges and subprocess/network/FFmpeg buffers
 use RAM, not disk. Once the buffer fills, backpressure pauses downloading.
-Chunks retry up to five times while their bytes remain in memory. Failed chunks,
-source timeouts and cancellation stop the transfer and close the upload sessions.
+Chunks get an initial attempt and at most two retries while their bytes remain
+in memory. Failed chunks, source timeouts and cancellation close the upload sessions.
 Incomplete current parts are not published; previously completed parts survive
 a later error. Actual bytes enforce limits per attachment, not per source video.
 Transfer speed depends on CDN and Telegram throughput as well as server bandwidth.
+
+Uploading all bytes and publishing the Telegram message are separate stages.
+After upload, the chat shows **Publishing to Telegram** and the logs record
+each publication attempt, deadline, elapsed time and result. Final publication
+uses `TRANSFER_STAGE_TIMEOUT=60` seconds per attempt and at most two retries
+(three attempts total, with 2s and 4s backoff). All publication retries use the
+same uploaded file and `SendMedia.random_id`, preventing duplicate messages
+when Telegram accepted a request but its response was lost. Pyrogram's hidden
+retry/FloodWait loops are disabled for these requests. Permanent RPC errors
+fail immediately; a FloodWait longer than the stage budget is reported instead
+of blocking the playlist for minutes or hours. An exhausted publication/chunk
+budget is not multiplied by restarting the entire video.
+
+Media-session startup and chunk requests also have stage deadlines; thumbnail
+preparation/upload has a total `THUMBNAIL_TIMEOUT=20` seconds and can be skipped.
+`TRANSFER_CLEANUP_TIMEOUT=10` bounds session, FFmpeg and relay cleanup, with
+transport closure attempted if a session stop fails. Status sends/edits/deletes
+use `TRANSFER_STATUS_TIMEOUT=10` and cannot turn a successfully published part
+into a failed transfer. Cancellation stops retries. After recovery is exhausted,
+the failed variant is reported and the playlist continues; confirmed parts stay
+in the chat. These deadlines cover asynchronous network/subprocess waits while
+the bot's event loop is running, not a crashed process or a suspended host.
 
 FFmpeg must be installed and on PATH. `STREAM_READ_TIMEOUT=90` bounds a stalled
 source; `UPLOAD_WORKERS=8` controls initial upload parallelism (clamped to 1–16).

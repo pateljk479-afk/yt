@@ -9,6 +9,7 @@ from html import escape
 from typing import Optional, List
 
 import config
+from transfer_runtime import bounded, close_media_sessions, best_effort_status
 from pyrogram import Client, filters
 from pyrogram.session import Session
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -232,7 +233,18 @@ async def _fast_save_file(
             _sf_mod.Session(self, dc_id, auth_key, test_mode, is_media=True)
             for _ in range(sessions_count)
         ]
-        await _sf_mod.asyncio.gather(*(s.start() for s in sessions))
+        try:
+            starts = await _sf_mod.asyncio.gather(*(bounded(s.start(), config.TRANSFER_STAGE_TIMEOUT,
+                                                           "File upload session startup") for s in sessions),
+                                                 return_exceptions=True)
+            for started in starts:
+                if isinstance(started, BaseException):
+                    raise started
+        except BaseException:
+            await close_media_sessions(sessions, "File upload startup")
+            if isinstance(path, (str, _sf_mod.PurePath)):
+                fp.close()
+            raise
 
         queue = _sf_mod.asyncio.Queue(sessions_count * 2)
         uploaded_bytes = 0
@@ -246,23 +258,18 @@ async def _fast_save_file(
                     queue.task_done()
                     return
                 rpc, chunk_len = item
-                for attempt in range(5):
-                    if worker_exception[0] is not None:
-                        queue.task_done()
-                        return
-                    try:
-                        await session.invoke(rpc)
-                        break
-                    except _sf_mod.FloodWait as e:
-                        logger.warning("Upload FloodWait: sleeping %s seconds", e.value)
-                        await _sf_mod.asyncio.sleep(e.value)
-                    except Exception as e:
-                        if attempt == 4:
-                            logger.error("Chunk upload failed after 5 retries: %s", e)
-                            worker_exception[0] = e
-                            queue.task_done()
-                            return
-                        await _sf_mod.asyncio.sleep(0.5 * (attempt + 1))
+                if worker_exception[0] is not None:
+                    queue.task_done()
+                    return
+                try:
+                    from streaming import _invoke_part
+                    await _invoke_part(session, rpc)
+                except Exception as e:
+                    # _invoke_part already owns the initial + two retries.
+                    logger.error("Chunk upload failed after two retries: %s", e)
+                    worker_exception[0] = e
+                    queue.task_done()
+                    return
 
                 queue.task_done()
                 uploaded_bytes += chunk_len
@@ -276,9 +283,10 @@ async def _fast_save_file(
                             *progress_args
                         )
                         if _sf_mod.inspect.iscoroutinefunction(progress):
-                            await func()
+                            await bounded(func(), config.TRANSFER_STATUS_TIMEOUT, "File upload progress")
                         else:
-                            await self.loop.run_in_executor(self.executor, func)
+                            await bounded(self.loop.run_in_executor(self.executor, func),
+                                          config.TRANSFER_STATUS_TIMEOUT, "File upload progress")
                     except _sf_mod.StopTransmission:
                         worker_exception[0] = _sf_mod.StopTransmission()
                         return
@@ -304,7 +312,8 @@ async def _fast_save_file(
                         file_part=file_part,
                         bytes=chunk
                     )
-                await sessions[0].invoke(rpc)
+                from streaming import _invoke_part
+                await _invoke_part(sessions[0], rpc)
                 return
 
             fp.seek(part_size * file_part)
@@ -336,11 +345,12 @@ async def _fast_save_file(
                 if not is_big and not is_missing_part:
                     md5_sum.update(chunk)
 
-                await queue.put((rpc, len(chunk)))
+                await bounded(queue.put((rpc, len(chunk))), config.TRANSFER_STAGE_TIMEOUT,
+                              "File upload queue")
                 current_part += 1
 
             for _ in sessions:
-                await queue.put(None)
+                await bounded(queue.put(None), config.TRANSFER_STAGE_TIMEOUT, "File upload queue shutdown")
 
             await _sf_mod.asyncio.gather(*workers)
 
@@ -367,7 +377,10 @@ async def _fast_save_file(
                     md5_checksum=md5_sum
                 )
         finally:
-            await _sf_mod.asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            await close_media_sessions(sessions, "File upload")
             if isinstance(path, (str, _sf_mod.PurePath)):
                 fp.close()
 
@@ -1377,7 +1390,7 @@ async def prepare_download(status_msg, url, quality_key, max_quality_height=None
         updater.sync_hook(data)
     try:
         async with download_semaphore:
-            await status_msg.edit_text("⚡ <b>Starting high-speed download...</b>")
+            await best_effort_status(status_msg.edit_text("⚡ <b>Starting high-speed download...</b>"))
             def prepare():
                 if config.STREAM_VIDEO_UPLOADS and quality_key != "audio":
                     try:
@@ -1438,10 +1451,10 @@ async def process_single_download(
                 estimated_parts, _ = plan_parts(estimate, video_part_limit())
                 plan_text = (f"Estimated source: {human_readable_size(estimate)} · ~{estimated_parts} part(s)\n"
                              if estimate else "Source size unknown; parts are limited by actual bytes.\n")
-                await status_msg.edit_text(
+                await best_effort_status(status_msg.edit_text(
                     "📤 <i>Transferring at the selected quality...</i>\n" + plan_text +
                     f"Each part: up to {human_readable_size(video_part_limit())}.\n"
-                    "Large videos arrive as numbered playable parts, at the selected quality.")
+                    "Large videos arrive as numbered playable parts, at the selected quality."))
                 current_part = 0
 
                 async def part_progress(current, total):
@@ -1452,20 +1465,31 @@ async def process_single_download(
                         updater.stage = f"Transferring Part {current_part} (~{stats.part_count} total) 📤"
                         updater.start_upload_time = 0
                         updater.last_upload_bytes = 0
-                    await updater.async_upload_hook(current, total)
+                    if stats.wait_stage.startswith("Retrying source"):
+                        await best_effort_status(status_msg.edit_text(
+                            f"🔄 <b>{escape(stats.wait_stage)}</b>\n"
+                            f"{stats.completed_parts} confirmed part(s) will be kept.\n"
+                            "Rebuilding the stream before continuing the unfinished part."))
+                    elif stats.wait_stage in ("Publishing to Telegram", "Verifying final part"):
+                        await best_effort_status(status_msg.edit_text(
+                            f"📤 <b>Part {current_part} uploaded · {escape(stats.wait_stage)}...</b>\n"
+                            f"💾 {human_readable_size(current)} · 100% uploaded\n"
+                            "Telegram confirmation has a timeout and up to two retries."))
+                    else:
+                        await updater.async_upload_hook(current, total)
 
                 async with download_semaphore:
                     active_transfer_stats = TransferStats()
                     sender = stream_video if isinstance(result, StreamPlan) else stream_local_video
                     await sender(client, chat_id, result, part_progress, stats=active_transfer_stats)
                 try:
-                    await status_msg.delete()
+                    await best_effort_status(status_msg.delete())
                 except Exception:
                     pass
                 return True
 
             # Verify integrity
-            await status_msg.edit_text("🔍 <i>Verifying media stream integrity...</i>")
+            await best_effort_status(status_msg.edit_text("🔍 <i>Verifying media stream integrity...</i>"))
             is_valid = await asyncio.to_thread(verify_media_integrity, result.file_path, is_audio=result.is_audio)
             if not is_valid:
                 raise ValueError("Downloaded file integrity check failed or file is corrupted.")
@@ -1477,7 +1501,7 @@ async def process_single_download(
 
             # Upload to Telegram
             updater.stage = "Uploading 📤"
-            await status_msg.edit_text("📤 <i>Uploading to Telegram at maximum speed...</i>")
+            await best_effort_status(status_msg.edit_text("📤 <i>Uploading to Telegram at maximum speed...</i>"))
 
             caption = (
                 f"🎬 <b>{result.title}</b>\n\n"
@@ -1500,7 +1524,8 @@ async def process_single_download(
                     if upload_attempt > 1:
                         logger.warning("Retrying upload for '%s' (attempt %d/%d)...", result.title, upload_attempt, max_upload_retries)
                         updater.start_upload_time = 0.0
-                        await status_msg.edit_text(f"📤 <i>Retrying Telegram upload (attempt {upload_attempt}/{max_upload_retries})...</i>")
+                        await best_effort_status(status_msg.edit_text(
+                            f"📤 <i>Retrying Telegram upload (attempt {upload_attempt}/{max_upload_retries})...</i>"))
 
                     if result.is_audio:
                         await client.send_audio(
@@ -1541,7 +1566,7 @@ async def process_single_download(
 
             updater.active = False
             try:
-                await status_msg.delete()
+                await best_effort_status(status_msg.delete())
             except Exception:
                 pass
             return True
@@ -1549,8 +1574,8 @@ async def process_single_download(
         except Exception as e:
             logger.error("Download failed for %s: %s", url, e, exc_info=True)
             try:
-                await status_msg.edit_text(
-                    f"❌ <b>Transfer Failed:</b>\n<code>{escape(user_transfer_error(e))}</code>")
+                await best_effort_status(status_msg.edit_text(
+                    f"❌ <b>Transfer Failed:</b>\n<code>{escape(user_transfer_error(e))}</code>"))
             except Exception:
                 pass
             return False
@@ -1584,9 +1609,9 @@ async def process_multiple_resolutions(client, status_msg, chat_id, entries, qua
             logger.info("Multiple-resolution transfer job=%s video=%d/%d quality=%s title=%s",
                         job.id if job else "single", index, len(entries), key, title)
             try:
-                item_status = await client.send_message(
+                item_status = await best_effort_status(client.send_message(
                     chat_id, f"📥 <b>[{index}/{len(entries)}] {escape(title)}</b>\n"
-                    f"Resolution: <b>{quality_name(key)}</b>")
+                    f"Resolution: <b>{quality_name(key)}</b>")) or status_msg
                 if metadata is None:
                     prepared = await prepare_download(item_status, url, key)
                 else:
@@ -1603,9 +1628,9 @@ async def process_multiple_resolutions(client, status_msg, chat_id, entries, qua
                     skipped += 1
                     actual_name = f"{actual_height}p" if actual_height else "source-quality"
                     try:
-                        await item_status.edit_text(
+                        await best_effort_status(item_status.edit_text(
                             f"↪️ <b>{quality_name(key)} skipped:</b> the same {actual_name} "
-                            "version was already delivered for this video.")
+                            "version was already delivered for this video."))
                     except Exception:
                         logger.debug("Duplicate-version status unavailable")
                     logger.info("Multiple-resolution duplicate skipped video=%d requested=%s actual=%s",
@@ -1628,8 +1653,8 @@ async def process_multiple_resolutions(client, status_msg, chat_id, entries, qua
                 logger.exception("Multiple-resolution variant failed video=%d quality=%s", index, key)
                 if item_status:
                     try:
-                        await item_status.edit_text(
-                            f"❌ <b>{quality_name(key)} failed:</b> <code>{escape(str(exc)[:250])}</code>")
+                        await best_effort_status(item_status.edit_text(
+                            f"❌ <b>{quality_name(key)} failed:</b> <code>{escape(str(exc)[:250])}</code>"))
                     except Exception:
                         logger.debug("Variant error status unavailable")
             finally:
@@ -1650,12 +1675,12 @@ async def process_multiple_resolutions(client, status_msg, chat_id, entries, qua
     logger.info("Multiple-resolution transfer completed videos=%d complete=%d incomplete=%d sent=%d failed=%d duplicates=%d",
                 len(entries), complete, incomplete, sent, failed, skipped)
     try:
-        await status_msg.edit_text(
+        await best_effort_status(status_msg.edit_text(
             f"🎉 <b>Multiple-resolution downloads completed</b>\n\n"
             f"Qualities: {quality_summary(qualities)}\n"
             f"✅ Videos completed: {complete} / {len(entries)}\n"
             f"📤 Versions delivered: {sent}\n❌ Failed versions: {failed}\n"
-            f"↪️ Duplicate versions skipped: {skipped}")
+            f"↪️ Duplicate versions skipped: {skipped}"))
     except Exception:
         logger.debug("Multiple-resolution final status unavailable")
 
@@ -1711,17 +1736,18 @@ async def process_playlist_downloads(
 
             item_status = None
             try:
-                item_status = await client.send_message(
+                item_status = await best_effort_status(client.send_message(
                     chat_id=chat_id,
-                    text=f"📥 <i>[{idx}/{total}] Downloading:</i> <b>{video_title}</b>",
-                )
+                    text=f"📥 <i>[{idx}/{total}] Downloading:</i> <b>{escape(video_title)}</b>",
+                )) or status_msg
                 result = await prepare_download(item_status, video_url, quality_key)
                 return item_status, video_url, result
             except Exception as e:
                 logger.error("Failed playlist item %d (%s): %s", idx, video_url, e)
                 if item_status:
                     try:
-                        await item_status.edit_text(f"❌ <b>Download Failed:</b>\n<code>{str(e)[:300]}</code>")
+                        await best_effort_status(item_status.edit_text(
+                            f"❌ <b>Download Failed:</b>\n<code>{escape(str(e)[:300])}</code>"))
                     except Exception:
                         pass
                 return None
@@ -1772,16 +1798,17 @@ async def process_playlist_downloads(
             item_status = None
             prepared = None
             try:
-                item_status = await client.send_message(
+                item_status = await best_effort_status(client.send_message(
                     chat_id=chat_id,
-                    text=f"📥 <i>[{idx}/{total}] Downloading:</i> <b>{video_title}</b>",
-                )
+                    text=f"📥 <i>[{idx}/{total}] Downloading:</i> <b>{escape(video_title)}</b>",
+                )) or status_msg
                 prepared = await prepare_download(item_status, video_url, quality_key)
             except Exception as e:
                 logger.error("Failed playlist download item %d (%s): %s", idx, video_url, e)
                 if item_status:
                     try:
-                        await item_status.edit_text(f"❌ <b>Download Failed:</b>\n<code>{str(e)[:300]}</code>")
+                        await best_effort_status(item_status.edit_text(
+                            f"❌ <b>Download Failed:</b>\n<code>{escape(str(e)[:300])}</code>"))
                     except Exception:
                         pass
                 failed += 1
@@ -1814,6 +1841,6 @@ async def process_playlist_downloads(
         summary_text += f"⚠️ <b>Failed items:</b> {failed}\n"
 
     try:
-        await status_msg.edit_text(summary_text)
+        await best_effort_status(status_msg.edit_text(summary_text))
     except Exception as e:
         logger.debug("Final status edit skipped: %s", e)
