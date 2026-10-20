@@ -186,8 +186,10 @@ async def test_slow_telegram_bounds_prefetch_and_cancellation_cleans_sessions(mo
     for _ in range(200):
         await asyncio.sleep(0)
     try:
-        # 4 queued chunks + 8 requests in flight + one producer read.
-        assert 8 <= reads <= 13
+        # 4 queued chunks + one ordered request on each of 2 Sessions + one
+        # producer read.  The bound proves Telegram backpressure reaches the
+        # source without keeping an unbounded copy of the file in memory.
+        assert 7 <= reads <= 8
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -298,6 +300,63 @@ async def test_fast_connection_keeps_working_while_another_is_slow(monkeypatch):
     finally:
         release.set()
         await asyncio.wait_for(task, 2)
+
+
+@pytest.mark.asyncio
+async def test_media_session_never_has_overlapping_mtproto_requests(monkeypatch):
+    """A Pyrogram Session must serialize its request/response map.
+
+    This regression covers the real failure mode where 16 sessions with an
+    eight-request depth triggered BadMsgNotification(33) and a KeyError after
+    the source had already finished streaming.
+    """
+    monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", True)
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_MAX_WORKERS", 2)
+    # Deliberately retain old, unsafe environment values.  The uploader must
+    # still use only one request per Session.
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 8)
+    monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 8)
+    active, peak = {}, {}
+
+    class OrderedSession:
+        def __init__(self, *args, **kwargs):
+            self.index = len(active)
+            active[self.index] = 0
+            peak[self.index] = 0
+            self.start, self.stop = AsyncMock(), AsyncMock()
+
+        async def invoke(self, rpc, **kwargs):
+            active[self.index] += 1
+            peak[self.index] = max(peak[self.index], active[self.index])
+            try:
+                await asyncio.sleep(0.002)
+                return True
+            finally:
+                active[self.index] -= 1
+
+    monkeypatch.setattr(streaming, "Session", OrderedSession)
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(PART_SIZE * 20 + 7))
+    reader.feed_eof()
+    stats = streaming.TransferStats()
+    _, sent = await asyncio.wait_for(streaming.upload_stream(fake_client(), reader, "ordered.mp4", stats=stats), 3)
+    assert sent == PART_SIZE * 20 + 7
+    assert stats.request_capacity == 2
+    assert peak and all(value == 1 for value in peak.values())
+
+
+@pytest.mark.asyncio
+async def test_bad_mtproto_notification_is_retried_not_counted_as_an_ack(monkeypatch):
+    session = SimpleNamespace(invoke=AsyncMock(side_effect=[
+        raw.types.BadMsgNotification(bad_msg_id=1, bad_msg_seqno=1, error_code=33), True
+    ]))
+    retried = Mock()
+    rpc = raw.functions.upload.SaveBigFilePart(file_id=1, file_part=0, file_total_parts=1, bytes=b"data")
+    with patch.object(streaming.asyncio, "sleep", new=AsyncMock()):
+        await streaming._invoke_part(session, rpc, retried, "test")
+    assert session.invoke.await_count == 2
+    retried.assert_called_once_with("network", 0)
 
 
 @pytest.mark.asyncio

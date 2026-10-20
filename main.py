@@ -41,10 +41,10 @@ async def main():
                 min(config.VIDEO_PART_SIZE_BYTES, config.MAX_FILE_SIZE) // (1024 * 1024))
     logger.info("  - Video transfers: %s", "direct streaming (no media files on disk)"
                 if config.STREAM_VIDEO_UPLOADS else "download to disk before upload")
-    logger.info("  - Telegram upload pipeline: %d connections x %d requests; %d MiB stream buffer",
+    logger.info("  - Telegram upload pipeline: %d independent connections x %d ordered request; %d MiB stream buffer",
                 max(1, min(config.UPLOAD_WORKERS, 16)), config.UPLOAD_REQUESTS_PER_CONNECTION,
                 config.STREAM_BUFFER_BYTES // (1024 * 1024))
-    logger.info("  - Adaptive upload: %s; ceiling %d connections x %d requests",
+    logger.info("  - Adaptive upload: %s; ceiling %d connections x %d ordered request",
                 config.UPLOAD_ADAPTIVE, config.UPLOAD_MAX_WORKERS, config.UPLOAD_MAX_REQUESTS_PER_CONNECTION)
     logger.info("  - Max Concurrent Downloads: %d", config.MAX_CONCURRENT_DOWNLOADS)
     logger.info("  - Fragment Parallel Streams: %d", config.CONCURRENT_FRAGMENT_DOWNLOADS)

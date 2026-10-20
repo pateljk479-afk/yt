@@ -302,11 +302,14 @@ Range responses and byte counts are validated before forwarding. Sources that
 ignore Range stay on direct FFmpeg input. No paid proxy fallback is used.
 
 `STREAM_BUFFER_MB=128` lets FFmpeg run ahead of Telegram within a fixed memory
-budget. Uploads pipeline `UPLOAD_REQUESTS_PER_CONNECTION=4` requests per
-`UPLOAD_WORKERS=8` connections (32 chunks / 16 MiB in flight initially).
-`UPLOAD_ADAPTIVE=true` reserves a pool up to `UPLOAD_MAX_WORKERS=16`
-connections and tests increasing active connections, then request depth up to
-`UPLOAD_MAX_REQUESTS_PER_CONNECTION=8` (128 chunks / 64 MiB maximum in flight).
+budget. Uploads use one ordered request per `UPLOAD_WORKERS=8` independent
+MTProto connection (8 chunks / 4 MiB in flight initially). `UPLOAD_ADAPTIVE=true`
+reserves a pool up to `UPLOAD_MAX_WORKERS=16` connections and tests increasing
+the number of active connections (16 chunks / 8 MiB maximum in flight).
+Pyrogram does not safely support multiple concurrent requests on one media
+session: using request depth caused Telegram sequence-number errors and could
+lose a response. `UPLOAD_REQUESTS_PER_CONNECTION` and
+`UPLOAD_MAX_REQUESTS_PER_CONNECTION` are consequently fixed at `1`.
 Only saturated transfers with queued bytes are expanded. Each setting is
 measured over two `UPLOAD_TUNE_INTERVAL=5` second samples. A trial must improve
 throughput by at least 10% to be kept; otherwise the previous setting is restored.
@@ -339,15 +342,16 @@ source; `UPLOAD_WORKERS=8` controls initial upload parallelism (clamped to 1–1
 `STREAM_PARALLEL_DOWNLOADS=false` disables parallel ranges for troubleshooting;
 `STREAM_DOWNLOAD_WORKERS` (1–8) and `STREAM_DOWNLOAD_CHUNK_KB` (256–4096) tune
 CDN reads. `STREAM_BUFFER_MB` is clamped to 1–256 and
-`UPLOAD_REQUESTS_PER_CONNECTION` to 1–8. Larger values consume more memory
-and cannot overcome an upstream CDN or Telegram route bandwidth limit.
+one ordered request per MTProto connection. More independent connections
+cannot overcome an upstream CDN or Telegram route bandwidth limit.
 At the default maximum, queued MP4 bytes, upload chunk payloads and two inputs'
-CDN ranges account for about 224 MiB, plus encryption copies, FFmpeg, sockets
+CDN ranges account for about 168 MiB, plus encryption copies, FFmpeg, sockets
 and the application. This is a bounded use of the available RAM, not an attempt
 to fill it. `UPLOAD_ADAPTIVE=false` retains a fixed upload window. Crypto worker
-threads are clamped to 1–8. Existing environment values override new defaults;
-update old `UPLOAD_WORKERS=4`, `STREAM_BUFFER_MB=32` and download settings if
-you want the new initial profile. `/logs` records every adaptive window change.
+threads are clamped to 1–8. Existing `UPLOAD_WORKERS`, `STREAM_BUFFER_MB` and
+download settings still apply; legacy request-depth environment values are
+ignored to keep each MTProto session ordered. `/logs` records every adaptive
+window change and any rejected MTProto chunk before it is retried.
 Set `STREAM_VIDEO_UPLOADS=false` to use the regular disk path.
 Audio conversion and unsupported fragment-list-only sources use that path.
 Direct MP4/WebM resources and VOD HLS can use the streaming splitter. Disk storage is bounded by

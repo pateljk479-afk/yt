@@ -408,6 +408,19 @@ from uploader import (
 
 logger = logging.getLogger(__name__)
 
+
+def user_transfer_error(error: BaseException) -> str:
+    """Return a useful, HTML-safe-length error for Telegram transfer failures."""
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, KeyError):
+            return ("Telegram upload session lost synchronization. The affected "
+                    "file was not published; the playlist will continue.")
+        current = current.__cause__ or current.__context__
+    return str(error)[:300] or type(error).__name__
+
 # Semaphore and lock to govern transfers and guarantee strict sequential execution
 transfer_lock = asyncio.Lock()
 download_semaphore = asyncio.Semaphore(1)
@@ -1536,7 +1549,8 @@ async def process_single_download(
         except Exception as e:
             logger.error("Download failed for %s: %s", url, e, exc_info=True)
             try:
-                await status_msg.edit_text(f"❌ <b>Download Failed:</b>\n<code>{str(e)[:300]}</code>")
+                await status_msg.edit_text(
+                    f"❌ <b>Transfer Failed:</b>\n<code>{escape(user_transfer_error(e))}</code>")
             except Exception:
                 pass
             return False

@@ -2,6 +2,11 @@ import pytest
 from bot import is_youtube_url, is_playlist_url
 
 
+def test_user_transfer_error_hides_opaque_pyrogram_key():
+    from bot import user_transfer_error
+    assert "lost synchronization" in user_transfer_error(KeyError(7698619322054213636))
+
+
 def test_is_youtube_url():
     valid_urls = [
         "https://www.youtube.com/watch?v=dQw4w9WgXcQ",

@@ -32,11 +32,15 @@ CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
 MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "1"))
 UPLOAD_WORKERS = max(1, min(16, int(os.getenv("UPLOAD_WORKERS", "8"))))
-UPLOAD_REQUESTS_PER_CONNECTION = max(1, min(8, int(os.getenv("UPLOAD_REQUESTS_PER_CONNECTION", "4"))))
+# A Pyrogram media Session is a single ordered MTProto transport.  Issuing
+# several SaveBigFilePart requests through one Session can let encryption work
+# complete out of order and cause Telegram's ``msg_seqno is too high`` error.
+# Parallelism is therefore provided by independent media Sessions, one request
+# at a time per Session.
+UPLOAD_REQUESTS_PER_CONNECTION = 1
 UPLOAD_ADAPTIVE = os.getenv("UPLOAD_ADAPTIVE", "true").lower() in ("true", "1", "yes")
 UPLOAD_MAX_WORKERS = max(UPLOAD_WORKERS, min(16, int(os.getenv("UPLOAD_MAX_WORKERS", "16"))))
-UPLOAD_MAX_REQUESTS_PER_CONNECTION = max(UPLOAD_REQUESTS_PER_CONNECTION, min(8, int(
-    os.getenv("UPLOAD_MAX_REQUESTS_PER_CONNECTION", "8"))))
+UPLOAD_MAX_REQUESTS_PER_CONNECTION = 1
 CRYPTO_WORKERS = max(1, min(8, int(os.getenv("CRYPTO_WORKERS", "4"))))
 UPLOAD_TUNE_INTERVAL = max(5, float(os.getenv("UPLOAD_TUNE_INTERVAL", "5")))
 UPLOAD_RECOVERY_SECONDS = max(10, float(os.getenv("UPLOAD_RECOVERY_SECONDS", "30")))

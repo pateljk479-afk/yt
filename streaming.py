@@ -153,8 +153,16 @@ async def _invoke_part(session, rpc, on_retry=None, transfer_id="-"):
         try:
             # Surface throttling/retries to our controller instead of hiding
             # them inside Pyrogram's own retry and FloodWait loops.
-            if not await session.invoke(rpc, retries=0, sleep_threshold=0,
-                                        timeout=config.PYROGRAM_WAIT_TIMEOUT):
+            response = await session.invoke(rpc, retries=0, sleep_threshold=0,
+                                            timeout=config.PYROGRAM_WAIT_TIMEOUT)
+            # Pyrogram returns BadMsgNotification instead of raising it.  It
+            # is not an acknowledgement that Telegram saved the part, so do
+            # not count it as success or finalize a damaged document/video.
+            if isinstance(response, (raw.types.BadMsgNotification, raw.types.BadServerSalt)):
+                logger.warning("Transfer %s Telegram rejected chunk %d with MTProto error %d; retrying",
+                               transfer_id, rpc.file_part, response.error_code)
+                raise OSError(f"Telegram rejected upload chunk with MTProto error {response.error_code}")
+            if not response:
                 raise OSError("Telegram rejected an upload chunk")
             return
         except FloodWait as exc:
@@ -164,7 +172,7 @@ async def _invoke_part(session, rpc, on_retry=None, transfer_id="-"):
                 raise
             logger.warning("Transfer %s Telegram chunk %d waiting %ds (FloodWait)", transfer_id, rpc.file_part, exc.value)
             await asyncio.sleep(exc.value)
-        except (OSError, asyncio.TimeoutError, InternalServerError) as exc:
+        except (OSError, KeyError, asyncio.TimeoutError, InternalServerError) as exc:
             if on_retry:
                 on_retry("network", 0)
             if attempt == 4:
@@ -184,10 +192,15 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
     stats = stats or TransferStats()
     stats.transfer_id = stats.transfer_id or secrets.token_hex(4)
     workers = max(1, min(config.UPLOAD_WORKERS, 16))
-    depth = config.UPLOAD_REQUESTS_PER_CONNECTION
+    # Keep every Session strictly ordered.  The aggressive 16 x 8 setting
+    # allowed concurrent ``Session.send`` calls over the same transport and
+    # produced BadMsgNotification(33) followed by Pyrogram's KeyError in its
+    # pending-response map.  More Sessions are safe; more simultaneous calls
+    # on one Session are not.
+    depth = 1
     pool_size = max(workers, min(config.UPLOAD_MAX_WORKERS, 16)) if config.UPLOAD_ADAPTIVE else workers
     control = AdaptiveUploadWindow(workers, depth, pool_size,
-                                   config.UPLOAD_MAX_REQUESTS_PER_CONNECTION, config.UPLOAD_ADAPTIVE,
+                                   1, config.UPLOAD_ADAPTIVE,
                                    recovery_seconds=config.UPLOAD_RECOVERY_SECONDS)
     stats.active_connections, stats.request_capacity = control.workers, control.capacity
     queue = asyncio.Queue(max(1, config.STREAM_BUFFER_BYTES // PART_SIZE))
@@ -206,11 +219,10 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
     auth_key = await client.storage.auth_key()
     test_mode = await client.storage.test_mode()
     if config.UPLOAD_ADAPTIVE:
-        warm = previous_upload_setting(client, dc_id, test_mode, workers, depth, pool_size,
-                                       config.UPLOAD_MAX_REQUESTS_PER_CONNECTION)
+        warm = previous_upload_setting(client, dc_id, test_mode, workers, depth, pool_size, 1)
         if warm:
             control = AdaptiveUploadWindow(workers, depth, pool_size,
-                                           config.UPLOAD_MAX_REQUESTS_PER_CONNECTION, True,
+                                           1, True,
                                            recovery_seconds=config.UPLOAD_RECOVERY_SECONDS, start=warm)
             stats.active_connections, stats.request_capacity = control.workers, control.capacity
             logger.info("Transfer %s reusing confirmed upload setting: %d connections x %d requests",
