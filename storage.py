@@ -41,6 +41,19 @@ def cleanup_download_folder(path):
         logger.info("Removed temporary download folder: %s", os.path.basename(target))
 
 
+def cleanup_stream_part(path):
+    """Delete one bot-owned staged stream part, never an arbitrary file."""
+    root = os.path.realpath(config.DOWNLOAD_DIR)
+    target = os.path.abspath(path)
+    if (os.path.dirname(os.path.realpath(target)) != root
+            or not os.path.basename(target).startswith("stream_part_")
+            or os.path.islink(target)):
+        raise ValueError("Refusing cleanup outside a bot-owned stream part")
+    if os.path.isfile(target):
+        os.unlink(target)
+        logger.info("Removed temporary stream part: %s", os.path.basename(target))
+
+
 def cleanup_stale_downloads():
     """Startup only: run before any download workers are started."""
     removed = 0
@@ -51,4 +64,10 @@ def cleanup_stale_downloads():
                 removed += 1
             except OSError:
                 logger.exception("Could not remove abandoned download folder")
+        elif entry.name.startswith("stream_part_") and entry.is_file(follow_symlinks=False):
+            try:
+                cleanup_stream_part(entry.path)
+                removed += 1
+            except OSError:
+                logger.exception("Could not remove abandoned stream part")
     return removed

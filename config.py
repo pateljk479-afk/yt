@@ -16,8 +16,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 # Per-attachment ceiling, not a limit on total source video size.
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(2000 * 1024 * 1024)))
 # Playable video parts; payload streams through the bounded queue, never stored
-# as a 1700 MiB RAM object. Keep room below the Telegram attachment ceiling.
-VIDEO_PART_SIZE_BYTES = max(1, min(1700, int(os.getenv("VIDEO_PART_SIZE_MB", "1700")))) * 1024 * 1024
+# as a 1500 MiB RAM object. Keep room below the Telegram attachment ceiling.
+# A current playable part is spooled for recovery while uploading concurrently.
+# The live protocol finalizes its exact count at EOF. 1.5 GiB leaves room for the bot on a
+# 2 GiB host while still keeping the number of Telegram attachments low.
+VIDEO_PART_SIZE_BYTES = max(1, min(1700, int(os.getenv("VIDEO_PART_SIZE_MB", "1500")))) * 1024 * 1024
 
 # Download & Temporary Storage
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.abspath("./downloads"))
@@ -31,16 +34,14 @@ MIN_FREE_DISK_BYTES = int(os.getenv("MIN_FREE_DISK_MB", "128")) * 1024 * 1024
 CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "4"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
 MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "1"))
-UPLOAD_WORKERS = max(1, min(16, int(os.getenv("UPLOAD_WORKERS", "8"))))
-# A Pyrogram media Session is a single ordered MTProto transport.  Issuing
-# several SaveBigFilePart requests through one Session can let encryption work
-# complete out of order and cause Telegram's ``msg_seqno is too high`` error.
-# Parallelism is therefore provided by independent media Sessions, one request
-# at a time per Session.
-UPLOAD_REQUESTS_PER_CONNECTION = 1
+UPLOAD_WORKERS = max(1, min(8, int(os.getenv("UPLOAD_WORKERS", "4"))))
+# OrderedMediaSession serializes message numbering/encryption/socket writes,
+# while responses overlap. Keep enough chunks in flight to hide network RTT.
+UPLOAD_REQUESTS_PER_CONNECTION = max(1, min(8, int(os.getenv("UPLOAD_REQUESTS_PER_CONNECTION", "4"))))
 UPLOAD_ADAPTIVE = os.getenv("UPLOAD_ADAPTIVE", "true").lower() in ("true", "1", "yes")
-UPLOAD_MAX_WORKERS = max(UPLOAD_WORKERS, min(16, int(os.getenv("UPLOAD_MAX_WORKERS", "16"))))
-UPLOAD_MAX_REQUESTS_PER_CONNECTION = 1
+UPLOAD_MAX_WORKERS = max(UPLOAD_WORKERS, min(8, int(os.getenv("UPLOAD_MAX_WORKERS", "8"))))
+UPLOAD_MAX_REQUESTS_PER_CONNECTION = max(UPLOAD_REQUESTS_PER_CONNECTION,
+    min(8, int(os.getenv("UPLOAD_MAX_REQUESTS_PER_CONNECTION", "8"))))
 CRYPTO_WORKERS = max(1, min(8, int(os.getenv("CRYPTO_WORKERS", "4"))))
 UPLOAD_TUNE_INTERVAL = max(5, float(os.getenv("UPLOAD_TUNE_INTERVAL", "5")))
 UPLOAD_RECOVERY_SECONDS = max(10, float(os.getenv("UPLOAD_RECOVERY_SECONDS", "30")))
@@ -52,7 +53,7 @@ TRANSFER_CLEANUP_TIMEOUT = max(2, float(os.getenv("TRANSFER_CLEANUP_TIMEOUT", "1
 TRANSFER_STATUS_TIMEOUT = max(2, float(os.getenv("TRANSFER_STATUS_TIMEOUT", "10")))
 THUMBNAIL_TIMEOUT = max(5, float(os.getenv("THUMBNAIL_TIMEOUT", "20")))
 PREFETCH_PLAYLIST = os.getenv("PREFETCH_PLAYLIST", "false").lower() in ("true", "1", "yes")
-# Stream MP4 output directly into Telegram instead of storing input + merged copies.
+# Stream MP4 into Telegram while one bounded recovery copy is written.
 STREAM_VIDEO_UPLOADS = os.getenv("STREAM_VIDEO_UPLOADS", "true").lower() in ("true", "1", "yes")
 STREAM_READ_TIMEOUT = max(30, int(os.getenv("STREAM_READ_TIMEOUT", "90")))
 STREAM_BUFFER_BYTES = max(1, min(256, int(os.getenv("STREAM_BUFFER_MB", "128")))) * 1024 * 1024

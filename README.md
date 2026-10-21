@@ -7,7 +7,7 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
 ## 🌟 Key Features
 
 1. **⚡ Maximum Speed Optimization (600 Mbps Tuned)**
-   - **Video streaming without disk copies**: direct CDN inputs are merged by FFmpeg and uploaded immediately in 512 KiB Telegram chunks, with bounded memory and parallel upload connections.
+   - **Simultaneous video download and upload**: direct CDN inputs are merged by FFmpeg and uploaded in 512 KiB Telegram chunks while one bounded recovery file is written alongside the upload.
    - **Regular downloader acceleration**: audio and unsupported fragment-only sources use yt-dlp fragment downloads and 10 MB HTTP chunks.
    - **C-accelerated MTProto encryption**: Integrates `TgCrypto` for lightning-fast Telegram chunk uploads.
    - **Aria2c integration**: Automatically detects and uses `aria2c` with 16 parallel connections if available on the system.
@@ -17,8 +17,8 @@ A production-ready Telegram Bot built with Python, Pyrogram (MTProto), and yt-dl
    - The source video can exceed Telegram's per-attachment limit.
    - Format bitrates and stream sizes are evaluated before presenting choices.
    - **No size-based downgrade**: Max Quality selects the highest available resolution. Large videos arrive as `Title_part_01.mp4`, `Title_part_02.mp4`, etc.
-   - Parts default to at most **1700 MiB** each, balanced from the size estimate. Cuts follow keyframes, preserving encoded video and audio without re-encoding.
-   - Source download, muxing and part uploads share the existing bounded-memory pipeline; a whole part is never held in RAM or staged on disk.
+   - Parts default to at most **1500 MiB** each, balanced from the size estimate. Cuts follow keyframes, preserving encoded video and audio without re-encoding.
+   - Source download remains direct and overlaps Telegram upload. The current part has one bounded recovery copy, deleted when its upload ends. A whole source video is never held in RAM or staged on disk.
    - Quality options show clear estimated file sizes (e.g., `⭐ Max Quality (2K ~ 1.6 GB)`, `1080p (~850 MB)`, `720p (~450 MB)`).
 
 3. **📋 Interactive 10-Per-Page Playlist Navigation & Multi-Selection**
@@ -91,7 +91,7 @@ cp .env.example .env
 | `API_HASH` | Telegram API Hash from [my.telegram.org](https://my.telegram.org) | *Required* |
 | `BOT_TOKEN` | Telegram Bot Token from [@BotFather](https://t.me/BotFather) | *Required* |
 | `MAX_FILE_SIZE` | Max file size in bytes (Telegram 2GB ceiling) | `2097152000` (2000 MB) |
-| `VIDEO_PART_SIZE_MB` | Hard playable-part ceiling in MiB (maximum 1700); memory stays bounded separately | `1700` |
+| `VIDEO_PART_SIZE_MB` | Hard playable-part ceiling in MiB (maximum 1700); one current part is staged then deleted | `1500` |
 | `DOWNLOAD_DIR` | Directory for temporary video and thumbnail files | `./downloads` |
 | `CONCURRENT_FRAGMENT_DOWNLOADS` | Number of parallel fragment downloads | `16` |
 | `MAX_CONCURRENT_DOWNLOADS` | Max simultaneous video downloads | `3` |
@@ -283,7 +283,7 @@ its own Telegram file identity; transport chunks are not separate chat files.
 ### Large videos without quality reduction
 
 The source size is analyzed before transfer (exact CDN range sizes replace
-approximate metadata when available). `VIDEO_PART_SIZE_MB=1700` sets the hard
+approximate metadata when available). `VIDEO_PART_SIZE_MB=1500` sets the hard
 per-attachment ceiling in MiB, also bounded by `MAX_FILE_SIZE`. A 7–7.5 GiB video
 typically needs five parts; a 2–2.5 GiB video needs two. The initial count is the
 minimum estimate divided by the hard ceiling, rounded up. Targets balance bytes
@@ -297,7 +297,10 @@ One FFmpeg process copies the selected encoded streams into fragmented MP4.
 each attachment, and rebases fragment clocks for independent playback while
 preserving audio/video timing. Media payload passes through in 512 KiB reads.
 The 128 MiB producer queue and existing parallel Telegram windows remain active;
-neither the full video nor a full 1700 MiB part is held in RAM or saved to disk.
+neither the full video nor a full 1500 MiB part is held in RAM. The current
+completed part is briefly staged on disk to obtain the exact positive Telegram
+file-part count required by `upload.saveBigFilePart`, then removed immediately
+after it is sent.
 An 8 MiB FFmpeg fragment-size target also bounds normal muxer read-ahead. No new
 Python dependency, transcoding or repeated download is required.
 
@@ -328,15 +331,50 @@ HTTP input connects FFmpeg to these reads; CDN traffic itself is always direct.
 Range responses and byte counts are validated before forwarding. Sources that
 ignore Range stay on direct FFmpeg input. No paid proxy fallback is used.
 
-`STREAM_BUFFER_MB=128` lets FFmpeg run ahead of Telegram within a fixed memory
-budget. Uploads use one ordered request per `UPLOAD_WORKERS=8` independent
-MTProto connection (8 chunks / 4 MiB in flight initially). `UPLOAD_ADAPTIVE=true`
-reserves a pool up to `UPLOAD_MAX_WORKERS=16` connections and tests increasing
-the number of active connections (16 chunks / 8 MiB maximum in flight).
-Pyrogram does not safely support multiple concurrent requests on one media
-session: using request depth caused Telegram sequence-number errors and could
-lose a response. `UPLOAD_REQUESTS_PER_CONNECTION` and
-`UPLOAD_MAX_REQUESTS_PER_CONNECTION` are consequently fixed at `1`.
+`STREAM_BUFFER_MB=128` bounds the upload source queue. Uploads start with
+`UPLOAD_WORKERS=4` independent MTProto connections and
+`UPLOAD_REQUESTS_PER_CONNECTION=4` outstanding requests per connection
+(16 chunks / 8 MiB in flight). Replies overlap to hide network latency.
+`ordered_session.py` holds a per-session lock from message numbering through
+encryption and the socket write, then releases it before waiting for the reply.
+This prevents encryption completion from reordering MTProto sequence numbers
+without forcing each chunk to wait for the previous reply. Cancellation or
+failure during a wire write retires that transport; late replies and response
+timeouts remove their result entries safely. A disconnected media transport
+wakes its pending requests and retires; Pyrogram cannot reopen its sockets in
+an unowned background reconnect after the upload has been cleaned up.
+`UPLOAD_ADAPTIVE=true` expands
+only after sustained delivery, up to `UPLOAD_MAX_WORKERS=8` connections and
+`UPLOAD_MAX_REQUESTS_PER_CONNECTION=8` outstanding requests each. Media
+sessions are created only as the active window grows.
+
+The live path follows [Telegram's streamed-upload protocol](https://core.telegram.org/api/files#streamed-uploads):
+all uploads with an unknown length use `SaveBigFilePart`, including streams
+smaller than 10 MiB. Intermediate RPCs use `file_total_parts=-1`. A one-chunk
+lookahead retains the final nonempty 512 KiB chunk (or shorter tail), waits for
+all previous RPCs to be acknowledged across every session, then sends that
+terminal chunk with the exact final count. An aligned EOF therefore needs no
+empty payload. Estimates affect progress and video splitting, never the
+protocol's final count. Known-size recovery uploads continue to use the
+standard positive-count protocol and the correct small-file MD5 when needed.
+
+`live_spool.py` starts a single source producer and a concurrent reader over a
+growing unbuffered recovery file. A condition wakes readers when bytes become
+available or a source error occurs. Source run-ahead is bounded by the configured
+window plus one 2 MiB write block; upload RAM buffering remains bounded
+separately. The producer checks the attachment limit before every write. Disk
+failures are terminal rather than triggering repeated CDN downloads. On upload
+transport exhaustion, the same producer finishes just the current part, then
+at most two known-size attempts use fresh sessions and smaller windows. This
+recovery path never restarts the CDN source. Source/FFmpeg failure recovery
+remains separate and can require replaying the source as described above.
+
+For an opt-in real Telegram check, run `python tools/check_streamed_upload.py`
+with the bot's existing credentials configured. It uses a separate in-memory
+session and about 15 MiB of unposted test documents. It checks aligned/partial
+EOF, a file above 10 MiB, actual ACKs before source EOF, final part counts and
+SHA-256 after downloading the resulting documents. It sends no chat messages
+and measures protocol correctness rather than hosting network bandwidth.
 Only saturated transfers with queued bytes are expanded. Each setting is
 measured over two `UPLOAD_TUNE_INTERVAL=5` second samples. A trial must improve
 throughput by at least 10% to be kept; otherwise the previous setting is restored.
@@ -355,11 +393,15 @@ before connecting the bot, allowing packet encryption/decryption to run on
 multiple threads. TgCrypto remains required for native cryptographic acceleration.
 FFmpeg continues stream-copying without re-encoding or changing quality.
 Free connection slots take the next chunk; slow connections do not hold up
-healthy ones. Sessions start concurrently, and status edits run outside the
-data path. These buffers plus CDN ranges and subprocess/network/FFmpeg buffers
+healthy ones. Sessions start gradually, and both staging and upload status
+edits run outside the data path. These buffers plus CDN ranges and subprocess/network/FFmpeg buffers
 use RAM, not disk. Once the buffer fills, backpressure pauses downloading.
 Chunks get an initial attempt and at most two retries while their bytes remain
 in memory. Failed chunks, source timeouts and cancellation close the upload sessions.
+If chunk recovery is exhausted, the current recovery attachment can be retried
+twice with fresh sessions, fewer connections and a smaller request depth,
+without downloading its bytes again. Exact total-parts validation, no empty
+EOF requests and publication idempotency remain enforced with pipelining.
 Incomplete current parts are not published; previously completed parts survive
 a later error. Actual bytes enforce limits per attachment, not per source video.
 Transfer speed depends on CDN and Telegram throughput as well as server bandwidth.
@@ -387,19 +429,20 @@ in the chat. These deadlines cover asynchronous network/subprocess waits while
 the bot's event loop is running, not a crashed process or a suspended host.
 
 FFmpeg must be installed and on PATH. `STREAM_READ_TIMEOUT=90` bounds a stalled
-source; `UPLOAD_WORKERS=8` controls initial upload parallelism (clamped to 1–16).
+source; `UPLOAD_WORKERS=4` controls initial upload parallelism (clamped to 1–8).
 `STREAM_PARALLEL_DOWNLOADS=false` disables parallel ranges for troubleshooting;
 `STREAM_DOWNLOAD_WORKERS` (1–8) and `STREAM_DOWNLOAD_CHUNK_KB` (256–4096) tune
-CDN reads. `STREAM_BUFFER_MB` is clamped to 1–256 and
-one ordered request per MTProto connection. More independent connections
+CDN reads. `STREAM_BUFFER_MB` is clamped to 1–256, and request depth to 1–8
+per ordered MTProto connection. More outstanding requests
 cannot overcome an upstream CDN or Telegram route bandwidth limit.
 At the default maximum, queued MP4 bytes, upload chunk payloads and two inputs'
-CDN ranges account for about 168 MiB, plus encryption copies, FFmpeg, sockets
+CDN ranges account for about 192 MiB, plus encryption copies, FFmpeg, sockets
 and the application. This is a bounded use of the available RAM, not an attempt
 to fill it. `UPLOAD_ADAPTIVE=false` retains a fixed upload window. Crypto worker
 threads are clamped to 1–8. Existing `UPLOAD_WORKERS`, `STREAM_BUFFER_MB` and
-download settings still apply; legacy request-depth environment values are
-ignored to keep each MTProto session ordered. `/logs` records every adaptive
+download settings still apply. An explicitly configured request depth of `1`
+disables pipelining; use `4` initially and `8` for the adaptive ceiling.
+`/logs` records every adaptive
 window change and any rejected MTProto chunk before it is retried.
 Set `STREAM_VIDEO_UPLOADS=false` to use the regular disk path.
 Audio conversion and unsupported fragment-list-only sources use that path.

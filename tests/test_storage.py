@@ -21,6 +21,17 @@ def test_startup_cleanup_only_removes_owned_folders(tmp_path, monkeypatch):
     assert protected.exists() and cookie.exists()
 
 
+def test_startup_cleanup_removes_only_owned_stream_parts(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", str(tmp_path))
+    staged = tmp_path / "stream_part_abandoned.mp4"
+    staged.write_bytes(b"partial")
+    unrelated = tmp_path / "course_part_01.mp4"
+    unrelated.write_bytes(b"keep")
+    assert storage.cleanup_stale_downloads() == 1
+    assert not staged.exists()
+    assert unrelated.exists()
+
+
 def test_cleanup_refuses_outside_download_directory(tmp_path, monkeypatch):
     root = tmp_path / "downloads"
     root.mkdir()

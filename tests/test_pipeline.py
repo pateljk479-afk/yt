@@ -140,7 +140,7 @@ async def test_empty_playlist_finishes():
 
 
 @pytest.mark.asyncio
-async def test_upload_progress_waits_five_seconds_even_at_completion():
+async def test_upload_progress_starts_immediately_then_throttles_even_at_completion():
     status = AsyncMock()
     updater = bot.ThrottledProgressUpdater(status, interval=5)
     with patch("bot.time.time", side_effect=[100, 102, 105, 106]):
@@ -148,7 +148,9 @@ async def test_upload_progress_waits_five_seconds_even_at_completion():
         await updater.async_upload_hook(20, 100)
         await updater.async_upload_hook(70, 100)
         await updater.async_upload_hook(100, 100)
-    assert status.edit_text.await_count == 1
+    assert status.edit_text.await_count == 2
+    assert "0.0%" in status.edit_text.call_args_list[0].args[0]
+    assert "70.0%" in status.edit_text.call_args_list[1].args[0]
     assert config.PROGRESS_UPDATE_INTERVAL >= 5
 
 

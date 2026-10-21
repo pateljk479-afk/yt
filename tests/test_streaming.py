@@ -21,6 +21,13 @@ def fixed_upload_window(monkeypatch):
     # Existing protocol tests exercise fixed windows; adaptive behavior has its
     # own deterministic controller tests and an integration test below.
     monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", False)
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 1)
+    monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 1)
+    # Splitter tests use tiny synthetic parts and must not depend on the free
+    # space of the developer's Windows drive; production reads this value from
+    # the host before staging each real attachment.
+    monkeypatch.setattr(streaming.shutil, "disk_usage",
+                        lambda _: SimpleNamespace(free=4 * 1024 * 1024 * 1024))
 
 
 def metadata():
@@ -111,13 +118,168 @@ async def test_streamed_protocol_and_byte_integrity(size, telegram):
     payload = media_bytes(size)
     reader.feed_data(payload)
     reader.feed_eof()
-    file, actual = await streaming.upload_stream(fake_client(), reader, "test.mp4")
+    file, actual = await streaming.upload_stream(fake_client(), reader, "test.mp4", total_size=size)
     assert actual == size and file.parts == math.ceil(size / PART_SIZE)
     assert b"".join(rpc.bytes for rpc in sorted(calls, key=lambda rpc: rpc.file_part)) == payload
-    assert all(rpc.file_total_parts == -1 for rpc in calls[:-1])
-    assert calls[-1].file_total_parts == file.parts
-    assert len(calls[-1].bytes) == size % PART_SIZE
+    assert all(isinstance(rpc, raw.functions.upload.SaveFilePart) for rpc in calls)
+    assert all(rpc.bytes for rpc in calls)
+    assert len(calls[-1].bytes) == (size % PART_SIZE or PART_SIZE)
     assert all(s.stop.await_count == 1 for s in sessions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [12, 1030, PART_SIZE - 1, PART_SIZE,
+                                   PART_SIZE + 1, PART_SIZE * 4, PART_SIZE * 24 + 37])
+async def test_unknown_length_finalization_uses_nonempty_last_chunk_and_exact_count(size, telegram):
+    calls, _ = telegram
+    payload = media_bytes(size)
+    reader = asyncio.StreamReader()
+    reader.feed_data(payload)
+    reader.feed_eof()
+    result, actual = await streaming.upload_stream(fake_client(), reader, "live.mp4")
+    ordered = sorted(calls, key=lambda rpc: rpc.file_part)
+    assert isinstance(result, raw.types.InputFileBig)
+    assert result.parts == math.ceil(size / PART_SIZE)
+    assert actual == size and len(ordered) == result.parts
+    assert all(isinstance(rpc, raw.functions.upload.SaveBigFilePart) and rpc.bytes for rpc in ordered)
+    assert [rpc.file_total_parts for rpc in ordered] == [-1] * (len(ordered) - 1) + [len(ordered)]
+    assert {rpc.file_id for rpc in ordered} == {result.id}
+    assert b"".join(rpc.bytes for rpc in ordered) == payload
+
+
+@pytest.mark.asyncio
+async def test_unknown_length_terminal_rpc_waits_for_all_previous_sessions(monkeypatch):
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 4)
+    active = 0
+    acknowledgements = []
+    async def invoke(rpc, **kwargs):
+        nonlocal active
+        if rpc.file_total_parts == -1:
+            active += 1
+            try:
+                await asyncio.sleep(0.01 if rpc.file_part % 2 else 0.02)
+                acknowledgements.append(rpc.file_part)
+            finally:
+                active -= 1
+        else:
+            assert active == 0
+            assert sorted(acknowledgements) == list(range(rpc.file_total_parts - 1))
+        return True
+    monkeypatch.setattr(streaming, "Session", Mock(return_value=SimpleNamespace(
+        start=AsyncMock(), stop=AsyncMock(), invoke=invoke)))
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(PART_SIZE * 7))
+    reader.feed_eof()
+    result, size = await streaming.upload_stream(fake_client(), reader, "live.mp4")
+    assert result.parts == 7 and size == PART_SIZE * 7
+
+
+@pytest.mark.asyncio
+async def test_live_part_sends_to_telegram_before_source_eof_and_reads_source_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", str(tmp_path))
+    first_ack = asyncio.Event()
+    calls = []
+    async def invoke(rpc, **kwargs):
+        if not calls:
+            assert not source.finished
+        if rpc.file_total_parts != -1:
+            assert source.finished
+        calls.append(rpc)
+        first_ack.set()
+        return True
+    monkeypatch.setattr(streaming, "Session", Mock(return_value=SimpleNamespace(
+        start=AsyncMock(), stop=AsyncMock(), invoke=invoke)))
+    payload = media_bytes(2 * 1024 * 1024)
+    class Source:
+        index = 1
+        calls = 0
+        finished = False
+        async def readexactly(self, count):
+            self.calls += 1
+            if self.calls == 1:
+                return payload
+            assert self.calls == 2  # Never restart the source download.
+            await asyncio.wait_for(first_ack.wait(), 2)
+            self.finished = True
+            raise asyncio.IncompleteReadError(b"tail", count)
+    source = Source()
+    result, size = await asyncio.wait_for(streaming._upload_live_part(fake_client(), source,
+        "live.mp4", len(payload) + 4, None, streaming.TransferStats(), len(payload) + 4), 4)
+    assert size == len(payload) + 4 and result.parts == 5
+    assert b"".join(rpc.bytes for rpc in sorted(calls, key=lambda r: r.file_part)) == payload + b"tail"
+    assert source.calls == 2 and list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["Telegram upload chunk failed after two retries",
+                                    "Telegram rejected upload chunk: FILE_PARTS_INVALID"])
+async def test_live_transport_exhaustion_recovers_without_redownloading_source(tmp_path, monkeypatch, telegram, failure):
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", str(tmp_path))
+    payload = media_bytes(5 * 1024 * 1024 + 123)
+    reader = asyncio.StreamReader()
+    reader.index = 1
+    reader.feed_data(payload)
+    reader.feed_eof()
+    original = streaming.upload_stream
+    attempts = []
+    async def fail_live(client, source, filename, estimate, progress=None, stats=None, **kwargs):
+        attempts.append(kwargs.get("total_size"))
+        if kwargs.get("total_size") is None:
+            await source.readexactly(PART_SIZE)
+            raise streaming.TransferStageError(failure)
+        assert kwargs["request_depth_limit"] >= 1
+        assert kwargs["max_worker_limit"] == kwargs["worker_limit"]
+        return await original(client, source, filename, estimate, progress, stats, **kwargs)
+    monkeypatch.setattr(streaming, "upload_stream", fail_live)
+    result, size = await streaming._upload_live_part(fake_client(), reader, "live.mp4", len(payload),
+        None, streaming.TransferStats(), len(payload))
+    assert attempts == [None, len(payload)]
+    assert size == len(payload)
+    calls = [rpc for rpc in telegram[0] if rpc.file_id == result.id]
+    assert b"".join(rpc.bytes for rpc in sorted(calls, key=lambda r: r.file_part)) == payload
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [PART_SIZE * 3, PART_SIZE * 3 + 1])
+async def test_stream_terminal_retry_reuses_id_count_index_and_payload(monkeypatch, size):
+    seen = []
+    terminal_attempts = 0
+    async def invoke(rpc, **kwargs):
+        nonlocal terminal_attempts
+        seen.append(rpc)
+        if rpc.file_total_parts != -1:
+            terminal_attempts += 1
+            if terminal_attempts == 1:
+                raise TimeoutError("final response lost")
+        return True
+    monkeypatch.setattr(streaming, "Session", Mock(return_value=SimpleNamespace(
+        start=AsyncMock(), stop=AsyncMock(), invoke=invoke)))
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(size))
+    reader.feed_eof()
+    stats = streaming.TransferStats()
+    file, actual = await streaming.upload_stream(fake_client(), reader, "live.mp4", stats=stats)
+    terminal = [rpc for rpc in seen if rpc.file_total_parts != -1]
+    assert len(terminal) == 2 and terminal[0] is terminal[1]
+    assert terminal[0].file_total_parts == file.parts == math.ceil(size / PART_SIZE)
+    assert stats.uploaded_bytes == actual == size and stats.retry_events == 1
+
+
+@pytest.mark.asyncio
+async def test_permanent_authorization_error_does_not_buffer_or_retry_the_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", str(tmp_path))
+    reader = asyncio.StreamReader()
+    reader.index = 1
+    error = streaming.TransferStageError("Telegram rejected upload chunk: AUTH_KEY_UNREGISTERED")
+    with patch.object(streaming, "upload_stream", new=AsyncMock(side_effect=error)), \
+         patch.object(streaming, "_upload_staged_part", new=AsyncMock()) as retry:
+        with pytest.raises(streaming.TransferStageError, match="AUTH_KEY_UNREGISTERED"):
+            await streaming._upload_live_part(fake_client(), reader, "live.mp4", 100,
+                                              None, streaming.TransferStats(), 100)
+    retry.assert_not_awaited()
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.asyncio
@@ -132,7 +294,7 @@ async def test_partial_reads_are_assembled_before_upload(telegram):
         reader.feed_eof()
 
     task = asyncio.create_task(feed())
-    await streaming.upload_stream(fake_client(), reader, "test.mp4")
+    await streaming.upload_stream(fake_client(), reader, "test.mp4", total_size=len(payload))
     await task
     assert all(len(rpc.bytes) == PART_SIZE for rpc in telegram[0][:-1])
 
@@ -144,8 +306,8 @@ async def test_limit_stops_upload_without_finalizing(monkeypatch, telegram):
     reader.feed_data(media_bytes(PART_SIZE + 2))
     reader.feed_eof()
     with pytest.raises(ValueError, match="size limit"):
-        await streaming.upload_stream(fake_client(), reader, "test.mp4")
-    assert not any(rpc.file_total_parts > 0 for rpc in telegram[0])
+        await streaming.upload_stream(fake_client(), reader, "test.mp4", total_size=PART_SIZE + 2)
+    assert all(rpc.bytes for rpc in telegram[0])
     assert all(s.stop.await_count == 1 for s in telegram[1])
 
 
@@ -157,7 +319,7 @@ async def test_failed_chunk_interrupts_stalled_source(monkeypatch):
     reader = asyncio.StreamReader()
     reader.feed_data(media_bytes(PART_SIZE))  # Source now stalls, without EOF.
     with pytest.raises(RuntimeError, match="chunk failed"):
-        await asyncio.wait_for(streaming.upload_stream(fake_client(), reader, "test.mp4"), 2)
+        await asyncio.wait_for(streaming.upload_stream(fake_client(), reader, "test.mp4", total_size=PART_SIZE), 2)
     assert stopped.await_count == config.UPLOAD_WORKERS
 
 
@@ -182,7 +344,8 @@ async def test_slow_telegram_bounds_prefetch_and_cancellation_cleans_sessions(mo
             reads += 1
             return media_bytes(size)
 
-    task = asyncio.create_task(streaming.upload_stream(fake_client(), EndlessReader(), "test.mp4"))
+    task = asyncio.create_task(streaming.upload_stream(fake_client(), EndlessReader(), "test.mp4",
+                                                        total_size=PART_SIZE * 1000))
     for _ in range(200):
         await asyncio.sleep(0)
     try:
@@ -214,7 +377,7 @@ async def test_1_5_gib_stream_with_tiny_disk_budget(monkeypatch):
     """Send a synthetic large stream lazily, without allocating a large file."""
     monkeypatch.setattr(config, "DOWNLOAD_STORAGE_LIMIT_BYTES", 1024)
     size = 1536 * 1024 * 1024
-    parts_sent, bytes_sent = 0, 0
+    parts_sent, bytes_sent, rpcs = 0, 0, []
     payload = media_bytes(PART_SIZE)
 
     class LargeReader:
@@ -230,14 +393,18 @@ async def test_1_5_gib_stream_with_tiny_disk_budget(monkeypatch):
         nonlocal parts_sent, bytes_sent
         parts_sent += 1
         bytes_sent += len(rpc.bytes)
+        rpcs.append(rpc)
         return True
 
     monkeypatch.setattr(streaming, "Session", Mock(return_value=SimpleNamespace(
         start=AsyncMock(), stop=AsyncMock(), invoke=invoke)))
-    file, total = await streaming.upload_stream(fake_client(), LargeReader(), "large.mp4")
+    file, total = await streaming.upload_stream(fake_client(), LargeReader(), "large.mp4", total_size=size)
     assert total == bytes_sent == size
     assert file.parts == size // PART_SIZE
-    assert parts_sent == file.parts + 1  # final empty EOF part
+    assert parts_sent == file.parts
+    # Every big-file request carries the same final count.  In particular,
+    # there is no invalid -1 sentinel and no empty request at exact EOF.
+    assert all(rpc.file_total_parts == file.parts and rpc.bytes for rpc in rpcs)
 
 
 @pytest.mark.asyncio
@@ -245,16 +412,16 @@ async def test_startup_failure_closes_sessions(monkeypatch):
     stopped = AsyncMock()
     monkeypatch.setattr(streaming, "Session", Mock(return_value=SimpleNamespace(
         start=AsyncMock(side_effect=OSError("offline")), stop=stopped)))
-    with pytest.raises(OSError, match="offline"):
-        await streaming.upload_stream(fake_client(), asyncio.StreamReader(), "test.mp4")
-    assert stopped.await_count == config.UPLOAD_WORKERS
+    with pytest.raises(streaming.TransferStageError, match="offline"):
+        await streaming.upload_stream(fake_client(), asyncio.StreamReader(), "test.mp4", total_size=1)
+    assert stopped.await_count == 1
 
 
 @pytest.mark.asyncio
 async def test_source_timeout_closes_sessions(monkeypatch, telegram):
     monkeypatch.setattr(config, "STREAM_READ_TIMEOUT", 0.01)
     with pytest.raises(TimeoutError):
-        await streaming.upload_stream(fake_client(), asyncio.StreamReader(), "test.mp4")
+        await streaming.upload_stream(fake_client(), asyncio.StreamReader(), "test.mp4", total_size=1)
     assert all(s.stop.await_count == 1 for s in telegram[1])
 
 
@@ -292,7 +459,8 @@ async def test_fast_connection_keeps_working_while_another_is_slow(monkeypatch):
     reader = asyncio.StreamReader()
     reader.feed_data(media_bytes(PART_SIZE * 12 + 7))
     reader.feed_eof()
-    task = asyncio.create_task(streaming.upload_stream(fake_client(), reader, "test.mp4"))
+    task = asyncio.create_task(streaming.upload_stream(fake_client(), reader, "test.mp4",
+                                                        total_size=PART_SIZE * 12 + 7))
     try:
         await asyncio.wait_for(fast_completed.wait(), 2)
         assert counts[0] == 0 and counts[1] >= 8
@@ -303,21 +471,15 @@ async def test_fast_connection_keeps_working_while_another_is_slow(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_media_session_never_has_overlapping_mtproto_requests(monkeypatch):
-    """A Pyrogram Session must serialize its request/response map.
-
-    This regression covers the real failure mode where 16 sessions with an
-    eight-request depth triggered BadMsgNotification(33) and a KeyError after
-    the source had already finished streaming.
-    """
+async def test_pipeline_keeps_multiple_requests_in_flight_with_bounded_depth(monkeypatch):
+    """Hide RTT with concurrent replies; ordered_session tests cover wire order."""
     monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", True)
     monkeypatch.setattr(config, "UPLOAD_WORKERS", 2)
     monkeypatch.setattr(config, "UPLOAD_MAX_WORKERS", 2)
-    # Deliberately retain old, unsafe environment values.  The uploader must
-    # still use only one request per Session.
     monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 8)
     monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 8)
     active, peak = {}, {}
+    full_window = asyncio.Event()
 
     class OrderedSession:
         def __init__(self, *args, **kwargs):
@@ -330,7 +492,11 @@ async def test_media_session_never_has_overlapping_mtproto_requests(monkeypatch)
             active[self.index] += 1
             peak[self.index] = max(peak[self.index], active[self.index])
             try:
-                await asyncio.sleep(0.002)
+                if sum(active.values()) == 16:
+                    full_window.set()
+                # Replies remain pending until the entire window has been
+                # written; no wall-clock timing assumption is needed.
+                await full_window.wait()
                 return True
             finally:
                 active[self.index] -= 1
@@ -340,10 +506,71 @@ async def test_media_session_never_has_overlapping_mtproto_requests(monkeypatch)
     reader.feed_data(media_bytes(PART_SIZE * 20 + 7))
     reader.feed_eof()
     stats = streaming.TransferStats()
-    _, sent = await asyncio.wait_for(streaming.upload_stream(fake_client(), reader, "ordered.mp4", stats=stats), 3)
+    _, sent = await asyncio.wait_for(streaming.upload_stream(
+        fake_client(), reader, "ordered.mp4", stats=stats, total_size=PART_SIZE * 20 + 7), 3)
     assert sent == PART_SIZE * 20 + 7
-    assert stats.request_capacity == 2
-    assert peak and all(value == 1 for value in peak.values())
+    assert stats.request_capacity == 16
+    assert peak and all(1 < value <= 8 for value in peak.values())
+
+
+@pytest.mark.asyncio
+async def test_live_progress_cannot_block_or_fail_media_reads(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "PROGRESS_UPDATE_INTERVAL", 0.001)
+    async def invoke(*args, **kwargs):
+        await asyncio.sleep(0.01)
+        return True
+    monkeypatch.setattr(streaming, "Session", Mock(return_value=SimpleNamespace(
+        start=AsyncMock(), stop=AsyncMock(), invoke=invoke)))
+    entered = asyncio.Event()
+    async def blocked_progress(current, total):
+        entered.set()
+        await asyncio.Event().wait()
+
+    payload = media_bytes(PART_SIZE * 2)
+    reader = asyncio.StreamReader()
+    reader.index = 1
+    reader.feed_data(payload)
+    reader.feed_eof()
+    _, size = await asyncio.wait_for(streaming._upload_live_part(fake_client(), reader,
+        "live.mp4", len(payload), blocked_progress, streaming.TransferStats(), len(payload)), 2)
+    assert entered.is_set() and size == len(payload)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_staged_retry_reduces_pipeline_and_reuses_local_bytes(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 4)
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 4)
+    attempts = []
+    async def upload(client, reader, filename, size, progress, stats, **kwargs):
+        attempts.append((kwargs["worker_limit"], kwargs["request_depth_limit"],
+                         await reader.readexactly(4)))
+        if len(attempts) < 3:
+            raise streaming.TransferStageError("transport failed")
+        return "uploaded", size
+    monkeypatch.setattr(streaming, "upload_stream", upload)
+    monkeypatch.setattr(streaming.asyncio, "sleep", AsyncMock())
+    path = tmp_path / "part.mp4"
+    path.write_bytes(b"data")
+    assert await streaming._upload_staged_part(None, path, "part.mp4", 4,
+        None, streaming.TransferStats(), 4) == ("uploaded", 4)
+    assert attempts == [(4, None, b"data"), (2, 2, b"data"), (1, 1, b"data")]
+
+
+@pytest.mark.asyncio
+async def test_reusing_attempt_stats_does_not_add_old_bytes_to_attachment_limit(telegram):
+    stats = streaming.TransferStats(part_index=2, part_count=3, completed_parts=1,
+                                    completed_bytes=1000)
+    client = fake_client()
+    for _ in range(2):
+        reader = asyncio.StreamReader()
+        reader.feed_data(media_bytes(4096))
+        reader.feed_eof()
+        _, size = await streaming.upload_stream(client, reader, "part.mp4", stats=stats,
+                                                max_size=4096, total_size=4096)
+        assert size == stats.source_bytes == stats.uploaded_bytes == 4096
+        assert (stats.part_index, stats.completed_parts, stats.completed_bytes) == (2, 1, 1000)
 
 
 @pytest.mark.asyncio
@@ -379,7 +606,8 @@ async def test_progress_edits_never_block_upload(monkeypatch, telegram):
             return media_bytes(count)
 
     _, size = await asyncio.wait_for(streaming.upload_stream(
-        fake_client(), Reader(), "test.mp4", progress=slow_progress), 2)
+        fake_client(), Reader(), "test.mp4", progress=slow_progress,
+        total_size=PART_SIZE * 10), 2)
     assert editing.is_set() and size == PART_SIZE * 10
 
 
@@ -419,7 +647,8 @@ async def test_adaptive_upload_activates_extra_connections_and_cleans_entire_poo
     reader.feed_data(media_bytes(PART_SIZE * 30))
     reader.feed_eof()
     stats = streaming.TransferStats()
-    task = asyncio.create_task(streaming.upload_stream(fake_client(), reader, "test.mp4", stats=stats))
+    task = asyncio.create_task(streaming.upload_stream(
+        fake_client(), reader, "test.mp4", stats=stats, total_size=PART_SIZE * 30))
     try:
         await asyncio.wait_for(expanded.wait(), 2)
         assert stats.active_connections == 2
@@ -456,7 +685,8 @@ async def test_transient_network_retry_does_not_collapse_upload_parallelism(monk
     reader.feed_data(media_bytes(PART_SIZE * 20 + 7))
     reader.feed_eof()
     stats = streaming.TransferStats()
-    await asyncio.wait_for(streaming.upload_stream(fake_client(), reader, "retry.mp4", stats=stats), 3)
+    await asyncio.wait_for(streaming.upload_stream(
+        fake_client(), reader, "retry.mp4", stats=stats, total_size=PART_SIZE * 20 + 7), 3)
     assert stats.retry_events == 1 and stats.throttle_events == 0
     assert stats.active_connections == 2 and stats.request_capacity == 2
 
@@ -492,7 +722,8 @@ async def test_real_floodwait_pauses_new_chunks_and_invalidates_warm_profile(mon
     reader.feed_data(media_bytes(PART_SIZE * 5 + 7))
     reader.feed_eof()
     stats = streaming.TransferStats()
-    await asyncio.wait_for(streaming.upload_stream(client, reader, "flood.mp4", stats=stats), 3)
+    await asyncio.wait_for(streaming.upload_stream(
+        client, reader, "flood.mp4", stats=stats, total_size=PART_SIZE * 5 + 7), 3)
     assert stats.throttle_events == 1 and stats.retry_events == 1
     assert client._bot_upload_profile is None
     assert later_chunks and min(later_chunks) - first_throttle >= 0.95
@@ -524,7 +755,7 @@ async def test_consecutive_files_reuse_confirmed_fast_setting_without_leaking_se
     first = asyncio.StreamReader()
     first.feed_data(media_bytes(PART_SIZE * 64))
     first.feed_eof()
-    await asyncio.wait_for(streaming.upload_stream(client, first, "first.mp4"), 4)
+    await asyncio.wait_for(streaming.upload_stream(client, first, "first.mp4", total_size=PART_SIZE * 64), 4)
     profile = client._bot_upload_profile
     assert profile.setting[0] == 2
     # Observe the warm start itself, without a later adaptive trial changing
@@ -534,7 +765,8 @@ async def test_consecutive_files_reuse_confirmed_fast_setting_without_leaking_se
     second.feed_data(media_bytes(PART_SIZE * 4))
     second.feed_eof()
     stats = streaming.TransferStats()
-    await asyncio.wait_for(streaming.upload_stream(client, second, "second.mp4", stats=stats), 2)
+    await asyncio.wait_for(streaming.upload_stream(
+        client, second, "second.mp4", stats=stats, total_size=PART_SIZE * 4), 2)
     assert (stats.active_connections, stats.request_capacity) == (profile.setting[0], profile.setting[0] * profile.setting[1])
     assert len(sessions) == 4 and all(s.stop.await_count == 1 for s in sessions)
 
@@ -778,17 +1010,18 @@ async def test_source_retry_replays_delivered_parts_without_duplicates_or_frame_
     monkeypatch.setattr(config, "VIDEO_PART_SIZE_BYTES", 80_000)
     result = SimpleNamespace(file_path=str(source), title="Course", duration=5,
                              width=320, height=240, file_size=source.stat().st_size)
-    original_upload = streaming.upload_stream
+    original_upload = streaming._upload_live_part
     failed = False
-    async def interrupt_once(client, part, *args, **kwargs):
+    async def interrupt_once(client, part, filename, size, progress, stats, limit):
         nonlocal failed
-        if part.index == 2 and not failed:
+        if stats.part_index == 2 and not failed:
             failed = True
             raise OSError("source transport broke")
-        return await original_upload(client, part, *args, **kwargs)
-    monkeypatch.setattr(streaming, "upload_stream", interrupt_once)
+        return await original_upload(client, part, filename, size, progress, stats, limit)
+    monkeypatch.setattr(streaming, "_upload_live_part", interrupt_once)
     client, stats = fake_client(), streaming.TransferStats()
     await asyncio.wait_for(streaming.stream_local_video(client, 1, result, stats=stats), 15)
+    assert failed
     requests = [call.args[0] for call in client.invoke.call_args_list]
     filenames = [request.media.attributes[1].file_name for request in requests]
     assert len(requests) >= 3 and len(set(filenames)) == len(requests)

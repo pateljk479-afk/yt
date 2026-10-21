@@ -11,6 +11,7 @@ from web import start_web_server
 from proxy_check import check_proxy
 from downloader import get_js_runtimes
 from storage import cleanup_stale_downloads
+from streaming import video_part_limit
 from upload_tuning import configure_crypto_workers
 from logging_setup import configure_logging
 
@@ -37,14 +38,14 @@ async def main():
     configure_crypto_workers()
     logger.info("Performance & Environment settings:")
     logger.info("  - Telegram Max File Size: %d MB", config.MAX_FILE_SIZE // (1024 * 1024))
-    logger.info("  - Original-quality video parts: at most %d MiB, bounded streaming memory",
-                min(config.VIDEO_PART_SIZE_BYTES, config.MAX_FILE_SIZE) // (1024 * 1024))
-    logger.info("  - Video transfers: %s", "direct streaming (no media files on disk)"
+    logger.info("  - Original-quality video parts: at most %d MiB; one live recovery file, deleted after upload",
+                video_part_limit() // (1024 * 1024))
+    logger.info("  - Video transfers: %s", "simultaneous direct CDN download and Telegram upload"
                 if config.STREAM_VIDEO_UPLOADS else "download to disk before upload")
-    logger.info("  - Telegram upload pipeline: %d independent connections x %d ordered request; %d MiB stream buffer",
-                max(1, min(config.UPLOAD_WORKERS, 16)), config.UPLOAD_REQUESTS_PER_CONNECTION,
+    logger.info("  - Telegram upload pipeline: %d connections x %d in-flight requests; ordered wire writes; %d MiB stream buffer",
+                max(1, min(config.UPLOAD_WORKERS, 8)), config.UPLOAD_REQUESTS_PER_CONNECTION,
                 config.STREAM_BUFFER_BYTES // (1024 * 1024))
-    logger.info("  - Adaptive upload: %s; ceiling %d connections x %d ordered request",
+    logger.info("  - Adaptive upload: %s; ceiling %d connections x %d in-flight requests",
                 config.UPLOAD_ADAPTIVE, config.UPLOAD_MAX_WORKERS, config.UPLOAD_MAX_REQUESTS_PER_CONNECTION)
     logger.info("  - Transfer recovery: 2 retries; stage %.0fs; cleanup %.0fs; status %.0fs; thumbnail %.0fs",
                 config.TRANSFER_STAGE_TIMEOUT, config.TRANSFER_CLEANUP_TIMEOUT,

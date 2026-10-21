@@ -494,6 +494,12 @@ class ThrottledProgressUpdater:
             self.start_upload_time = now
             self.last_upload_time = now
             self.last_upload_bytes = current
+            # Show the progress panel as soon as a transfer phase starts.
+            # In particular, a large video part can spend minutes being
+            # staged on disk before Telegram's upload callback begins.
+            text = format_progress_bar(current, total, 0, 0, stage=self.stage)
+            await self._safe_edit(text)
+            return
 
         dt = now - self.last_upload_time
         if dt >= self.interval:
@@ -1461,25 +1467,41 @@ async def process_single_download(
                     result.collection = VideoCollection(chat_id, url)
 
             if isinstance(result, StreamPlan) or (not result.is_audio and result.file_size > video_part_limit()):
-                updater.stage = "Transferring to Telegram 📤"
+                updater.stage = "Downloading & uploading Part 1 📤"
                 estimate = result.estimated_size if isinstance(result, StreamPlan) else result.file_size
                 estimated_parts, _ = plan_parts(estimate, video_part_limit())
                 plan_text = (f"Estimated source: {human_readable_size(estimate)} · ~{estimated_parts} part(s)\n"
                              if estimate else "Source size unknown; parts are limited by actual bytes.\n")
                 await best_effort_status(status_msg.edit_text(
-                    "📤 <i>Transferring at the selected quality...</i>\n" + plan_text +
+                    format_progress_bar(0, min(estimate, video_part_limit()) if estimate else 0,
+                                        0, 0, stage=updater.stage) + "\n\n" + plan_text +
                     f"Each part: up to {human_readable_size(video_part_limit())}.\n"
-                    "Large videos arrive as numbered playable parts, at the selected quality."))
+                    "Download and Telegram upload run together at the selected quality."))
                 current_part = 0
+                last_progress_phase = None
 
                 async def part_progress(current, total):
-                    nonlocal current_part
+                    nonlocal current_part, last_progress_phase
                     stats = active_transfer_stats
                     if stats.part_index != current_part:
                         current_part = stats.part_index
-                        updater.stage = f"Transferring Part {current_part} (~{stats.part_count} total) 📤"
+                        updater.stage = f"Downloading & uploading Part {current_part} (~{stats.part_count} total) 📤"
                         updater.start_upload_time = 0
                         updater.last_upload_bytes = 0
+                        last_progress_phase = None
+                    phase = "staging" if stats.wait_stage == "Staging part on server" else "uploading"
+                    if phase != last_progress_phase:
+                        # Measure download-to-disk and Telegram upload speeds
+                        # independently; their byte counters have different
+                        # origins and must not share a rate sample.
+                        updater.start_upload_time = 0
+                        updater.last_upload_bytes = 0
+                        last_progress_phase = phase
+                    if phase == "staging":
+                        updater.stage = f"Recovering upload · Part {current_part} 📥"
+                        await updater.async_upload_hook(current, total)
+                        return
+                    updater.stage = f"Downloading & uploading Part {current_part} (~{stats.part_count} total) 📤"
                     if stats.wait_stage.startswith("Retrying source"):
                         await best_effort_status(status_msg.edit_text(
                             f"🔄 <b>{escape(stats.wait_stage)}</b>\n"
