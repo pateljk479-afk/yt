@@ -64,7 +64,7 @@ class AdaptiveUploadWindow:
     def capacity(self):
         return self.workers * self.depth
 
-    def observe(self, rate, backlog, saturated, congested=False, now=None):
+    def observe(self, rate, backlog, saturated, congested=False, now=None, settled=True):
         now = time.monotonic() if now is None else now
         before = (self.workers, self.depth)
         if not self.enabled:
@@ -90,7 +90,10 @@ class AdaptiveUploadWindow:
                 self.baseline = None
                 self.samples.clear()
                 self.reason = "recovering upload capacity"
-            if not backlog or not saturated or rate <= 0:
+            # Handshakes and window changes contaminate a throughput sample.
+            # Keep the previous baseline, but require two fresh full-window
+            # samples before judging a trial. Real errors still back off above.
+            if not settled or not backlog or not saturated or rate <= 0:
                 self.samples.clear()
                 return False
             self.samples.append(rate)

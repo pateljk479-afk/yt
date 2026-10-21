@@ -662,6 +662,168 @@ async def test_adaptive_upload_activates_extra_connections_and_cleans_entire_poo
 
 
 @pytest.mark.asyncio
+async def test_ready_sockets_keep_sending_while_new_connection_handshakes(monkeypatch):
+    monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", True)
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 1)
+    monkeypatch.setattr(config, "UPLOAD_MAX_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 1)
+    monkeypatch.setattr(config, "UPLOAD_TUNE_INTERVAL", 0.02)
+    starting, release, continued, expanded = (asyncio.Event() for _ in range(4))
+    sessions, calls = [], []
+    sent_during_start = 0
+    observations = []
+    original = streaming.AdaptiveUploadWindow.observe
+
+    def observe(control, *args, **kwargs):
+        if starting.is_set() and not release.is_set():
+            observations.append(kwargs["settled"])
+        return original(control, *args, **kwargs)
+
+    monkeypatch.setattr(streaming.AdaptiveUploadWindow, "observe", observe)
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            self.index = len(sessions)
+            sessions.append(self)
+            self.stop = AsyncMock()
+
+        async def start(self):
+            if self.index:
+                starting.set()
+                await release.wait()
+
+        async def invoke(self, rpc, **kwargs):
+            nonlocal sent_during_start
+            calls.append(rpc.file_part)
+            if self.index:
+                expanded.set()
+            elif starting.is_set() and not release.is_set():
+                sent_during_start += 1
+                if sent_during_start >= 12:
+                    continued.set()
+            await asyncio.sleep(0.01)
+            return True
+
+    monkeypatch.setattr(streaming, "Session", FakeSession)
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(PART_SIZE * 80 + 7))
+    reader.feed_eof()
+    stats = streaming.TransferStats()
+    task = asyncio.create_task(streaming.upload_stream(
+        fake_client(), reader, "growth.mp4", stats=stats))
+    try:
+        await asyncio.wait_for(starting.wait(), 2)
+        await asyncio.wait_for(continued.wait(), 2)
+        assert observations and not any(observations)
+        assert stats.active_connections == stats.request_capacity == 1
+        release.set()
+        await asyncio.wait_for(expanded.wait(), 2)
+        _, size = await asyncio.wait_for(task, 3)
+        assert size == PART_SIZE * 80 + 7
+        assert sorted(calls) == list(range(81))
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert len(sessions) == 2 and all(s.stop.await_count == 1 for s in sessions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["failure", "cancel"])
+async def test_background_growth_failure_and_cancellation_close_half_open_socket(monkeypatch, outcome):
+    monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", True)
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 1)
+    monkeypatch.setattr(config, "UPLOAD_MAX_WORKERS", 2)
+    monkeypatch.setattr(config, "UPLOAD_MAX_REQUESTS_PER_CONNECTION", 1)
+    monkeypatch.setattr(config, "UPLOAD_TUNE_INTERVAL", 0.05)
+    starting, release = asyncio.Event(), asyncio.Event()
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            self.index = len(sessions)
+            sessions.append(self)
+            self.stop = AsyncMock()
+
+        async def start(self):
+            if self.index:
+                starting.set()
+                await release.wait()
+                raise OSError("handshake failed")
+
+        async def invoke(self, rpc, **kwargs):
+            await asyncio.sleep(0.01)
+            return True
+
+    monkeypatch.setattr(streaming, "Session", FakeSession)
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(PART_SIZE * 60))
+    reader.feed_eof()
+    task = asyncio.create_task(streaming.upload_stream(fake_client(), reader, "growth.mp4"))
+    try:
+        await asyncio.wait_for(starting.wait(), 2)
+        if outcome == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            release.set()
+            with pytest.raises(streaming.TransferStageError, match="session startup failed"):
+                await asyncio.wait_for(task, 2)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert len(sessions) == 2 and all(s.stop.await_count == 1 for s in sessions)
+
+
+@pytest.mark.asyncio
+async def test_fast_window_dispatches_64_chunks_before_waiting_for_first_ack(monkeypatch):
+    monkeypatch.setattr(config, "UPLOAD_WORKERS", 8)
+    monkeypatch.setattr(config, "UPLOAD_REQUESTS_PER_CONNECTION", 8)
+    full, release = asyncio.Event(), asyncio.Event()
+    sessions, calls = [], []
+    active = peak = 0
+
+    class FakeSession:
+        def __init__(self, *args, **kwargs):
+            sessions.append(self)
+            self.start, self.stop = AsyncMock(), AsyncMock()
+            self.active = self.peak = 0
+
+        async def invoke(self, rpc, **kwargs):
+            nonlocal active, peak
+            calls.append(rpc)
+            active += 1
+            self.active += 1
+            peak, self.peak = max(peak, active), max(self.peak, self.active)
+            if active == 64:
+                full.set()
+            await release.wait()
+            active -= 1
+            self.active -= 1
+            return True
+
+    monkeypatch.setattr(streaming, "Session", FakeSession)
+    reader = asyncio.StreamReader()
+    reader.feed_data(media_bytes(PART_SIZE * 70 + 7))
+    reader.feed_eof()
+    task = asyncio.create_task(streaming.upload_stream(fake_client(), reader, "fast.mp4"))
+    try:
+        await asyncio.wait_for(full.wait(), 2)
+        assert len(calls) == 64 and all(s.peak == 8 for s in sessions)
+        release.set()
+        result, size = await asyncio.wait_for(task, 2)
+        assert size == PART_SIZE * 70 + 7 and result.parts == 71
+        assert peak == 64
+        assert [rpc.file_part for rpc in calls] == list(range(71))
+        assert all(rpc.file_total_parts == -1 for rpc in calls[:-1])
+        assert calls[-1].file_total_parts == 71
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert len(sessions) == 8 and all(s.stop.await_count == 1 for s in sessions)
+
+
+@pytest.mark.asyncio
 async def test_transient_network_retry_does_not_collapse_upload_parallelism(monkeypatch):
     monkeypatch.setattr(config, "UPLOAD_ADAPTIVE", True)
     monkeypatch.setattr(config, "UPLOAD_WORKERS", 2)

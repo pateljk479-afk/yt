@@ -263,7 +263,8 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
     sessions = []
     pending = {}
     loads = []
-    producer = reporter = tuner = None
+    producer = reporter = tuner = grower = None
+    ready_sessions = 0
     peak_pending = 0
     total = part = 0
     is_big = live or total_size > 10 * 1024 * 1024
@@ -348,7 +349,7 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                         "buffer=%.1f MiB; active=%d; in-flight=%d/%d; retries=%d throttles=%d; waiting=%s",
                         stats.transfer_id, stats.source_bps / 1024, stats.upload_bps / 1024,
                         stats.source_bytes, stats.uploaded_bytes, stats.buffered_bytes / (1024 * 1024),
-                        control.workers, stats.in_flight, control.capacity,
+                        stats.active_connections, stats.in_flight, stats.request_capacity,
                         stats.retry_events, stats.throttle_events, stats.wait_stage)
             if progress:
                 try:
@@ -374,16 +375,21 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
     async def tune():
         nonlocal peak_pending
         previous_time, previous_bytes, previous_retries = stats.ready_at, 0, 0
+        previous_window = (control.workers, control.depth, ready_sessions)
         while True:
             await asyncio.sleep(config.UPLOAD_TUNE_INTERVAL)
             now = time.monotonic()
             rate = (stats.uploaded_bytes - previous_bytes) / max(0.001, now - previous_time)
+            window = (control.workers, control.depth, ready_sessions)
+            settled = window == previous_window and ready_sessions >= control.workers
+            previous_window = window
             changed = control.observe(rate, backlog=not queue.empty(),
                                       saturated=peak_pending >= control.capacity * 0.8,
-                                      congested=stats.retry_events > previous_retries)
+                                      congested=stats.retry_events > previous_retries,
+                                      settled=settled)
             previous_time, previous_bytes, previous_retries = now, stats.uploaded_bytes, stats.retry_events
             peak_pending = len(pending)
-            stats.active_connections, stats.request_capacity = control.workers, control.capacity
+            refresh_capacity()
             if changed:
                 logger.info("Transfer %s upload tuning: %d connections x %d requests (%s); %.1f KiB/s; "
                             "resume-in=%.1fs", stats.transfer_id, control.workers, control.depth, control.reason,
@@ -400,8 +406,9 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
         on constrained hosts.  Sessions are independent, so later growth is
         safe and does not disturb chunks already acknowledged by earlier ones.
         """
+        nonlocal ready_sessions
         required = min(required, pool_size)
-        while len(sessions) < required:
+        while ready_sessions < required:
             session = Session(client, dc_id, auth_key, test_mode, is_media=True)
             # Keep ownership before startup so a half-open connection is still
             # closed if its handshake fails.
@@ -412,8 +419,29 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                               "Telegram media session startup")
             except Exception as exc:
                 raise TransferStageError("Telegram media session startup failed: " + str(exc)) from exc
+            ready_sessions += 1
+            refresh_capacity()
             logger.info("Transfer %s media session ready: %d/%d active capacity",
                         stats.transfer_id, len(sessions), required)
+
+    def refresh_capacity():
+        stats.active_connections = min(control.workers, ready_sessions)
+        stats.request_capacity = stats.active_connections * control.depth
+
+    def request_growth():
+        nonlocal grower
+        if grower is not None and grower.done():
+            grower.result()
+            grower = None
+        if ready_sessions < control.workers and grower is None:
+            # Never stop dispatching on ready sockets while a new socket
+            # handshakes. Only this task owns growth; cleanup owns all sockets,
+            # including the one that may still be halfway through startup.
+            grower = asyncio.create_task(ensure_media_sessions(control.workers))
+        refresh_capacity()
+
+    def capacity():
+        return min(control.workers, ready_sessions) * control.depth
 
     async def collect(done):
         for task in done:
@@ -425,9 +453,17 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                 raise result
 
     async def drain(one=False):
-        done, _ = await asyncio.wait(pending, return_when=(
-            asyncio.FIRST_COMPLETED if one else asyncio.ALL_COMPLETED))
-        await collect(done)
+        while pending:
+            request_growth()
+            waiters = set(pending)
+            if grower is not None:
+                waiters.add(grower)
+            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            request_growth()
+            completed = done & pending.keys()
+            await collect(completed)
+            if one:
+                return
 
     try:
         setup_started = time.monotonic()
@@ -442,9 +478,9 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
         while True:
             # A tuning backoff can shrink below the number already in flight.
             # Drain those requests without dropping or resending their bytes.
-            while len(pending) >= control.capacity:
+            request_growth()
+            while len(pending) >= capacity():
                 await drain(one=True)
-            await ensure_media_sessions(control.workers)
             read = asyncio.create_task(queue.get())
             try:
                 while not read.done():
@@ -453,7 +489,10 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                     waiters = set(pending) | {read}
                     if not producer.done():
                         waiters.add(producer)
+                    if grower is not None:
+                        waiters.add(grower)
                     done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                    request_growth()
                     await collect(done & pending.keys())
                 if producer.done():
                     producer.result()
@@ -518,16 +557,16 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                 file_id=file_id, file_part=part, file_total_parts=-1 if live else file_total_parts,
                 bytes=chunk) if is_big else \
                 raw.functions.upload.SaveFilePart(file_id=file_id, file_part=part, bytes=chunk)
-            while len(pending) >= control.capacity:
+            request_growth()
+            while len(pending) >= capacity():
                 await drain(one=True)
-            await ensure_media_sessions(control.workers)
             while pause_until > time.monotonic():
                 await asyncio.sleep(pause_until - time.monotonic())
             # Respect per-session depth even while a smaller window drains.
             # A slow connection must not block free slots on healthy ones.
-            while not any(loads[i] < control.depth for i in range(control.workers)):
+            while not any(loads[i] < control.depth for i in range(min(control.workers, ready_sessions))):
                 await drain(one=True)
-            index = min((i for i in range(control.workers) if loads[i] < control.depth),
+            index = min((i for i in range(min(control.workers, ready_sessions)) if loads[i] < control.depth),
                         key=lambda i: loads[i])
             loads[index] += 1
             pending[asyncio.create_task(send(index, rpc))] = index
@@ -553,7 +592,7 @@ async def upload_stream(client, reader, filename, estimated_size=0, progress=Non
                        stats.transfer_id, type(exc).__name__, stats.source_bytes, stats.uploaded_bytes, len(pending))
         raise
     finally:
-        tasks = list(pending) + [t for t in (producer, reporter, tuner) if t is not None]
+        tasks = list(pending) + [t for t in (producer, reporter, tuner, grower) if t is not None]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

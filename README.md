@@ -332,9 +332,9 @@ Range responses and byte counts are validated before forwarding. Sources that
 ignore Range stay on direct FFmpeg input. No paid proxy fallback is used.
 
 `STREAM_BUFFER_MB=128` bounds the upload source queue. Uploads start with
-`UPLOAD_WORKERS=4` independent MTProto connections and
-`UPLOAD_REQUESTS_PER_CONNECTION=4` outstanding requests per connection
-(16 chunks / 8 MiB in flight). Replies overlap to hide network latency.
+`UPLOAD_WORKERS=8` independent MTProto connections and
+`UPLOAD_REQUESTS_PER_CONNECTION=8` outstanding requests per connection
+(64 chunks / 32 MiB in flight). Replies overlap to hide network latency.
 `ordered_session.py` holds a per-session lock from message numbering through
 encryption and the socket write, then releases it before waiting for the reply.
 This prevents encryption completion from reordering MTProto sequence numbers
@@ -343,10 +343,18 @@ failure during a wire write retires that transport; late replies and response
 timeouts remove their result entries safely. A disconnected media transport
 wakes its pending requests and retires; Pyrogram cannot reopen its sockets in
 an unowned background reconnect after the upload has been cleaned up.
-`UPLOAD_ADAPTIVE=true` expands
-only after sustained delivery, up to `UPLOAD_MAX_WORKERS=8` connections and
-`UPLOAD_MAX_REQUESTS_PER_CONNECTION=8` outstanding requests each. Media
-sessions are created only as the active window grows.
+`UPLOAD_ADAPTIVE=true` backs off on retries/throttling and can expand a lower
+configured starting window after sustained delivery, up to
+`UPLOAD_MAX_WORKERS=8` connections and `UPLOAD_MAX_REQUESTS_PER_CONNECTION=8`
+outstanding requests each. Extra media sessions handshake in the background
+while ready sessions continue sending chunks. Throughput trials exclude
+handshake and partial-window intervals, so connection setup cannot falsely
+reject a faster setting. Logs report ready connections and usable capacity,
+and final draining updates the in-flight count as individual requests finish.
+Existing environment overrides are respected: installations explicitly using
+`UPLOAD_WORKERS=4` / `UPLOAD_REQUESTS_PER_CONNECTION=4` should set both to `8`
+to use the full starting window. The ordered transport, terminal-chunk barrier,
+bounded recovery file and two-retry recovery policy remain enabled.
 
 The live path follows [Telegram's streamed-upload protocol](https://core.telegram.org/api/files#streamed-uploads):
 all uploads with an unknown length use `SaveBigFilePart`, including streams
@@ -429,7 +437,7 @@ in the chat. These deadlines cover asynchronous network/subprocess waits while
 the bot's event loop is running, not a crashed process or a suspended host.
 
 FFmpeg must be installed and on PATH. `STREAM_READ_TIMEOUT=90` bounds a stalled
-source; `UPLOAD_WORKERS=4` controls initial upload parallelism (clamped to 1–8).
+source; `UPLOAD_WORKERS=8` controls initial upload parallelism (clamped to 1–8).
 `STREAM_PARALLEL_DOWNLOADS=false` disables parallel ranges for troubleshooting;
 `STREAM_DOWNLOAD_WORKERS` (1–8) and `STREAM_DOWNLOAD_CHUNK_KB` (256–4096) tune
 CDN reads. `STREAM_BUFFER_MB` is clamped to 1–256, and request depth to 1–8

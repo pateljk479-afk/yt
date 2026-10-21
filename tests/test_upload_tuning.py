@@ -40,6 +40,27 @@ def test_slower_trial_restores_previous_setting():
     assert control.capacity == 16 and control.stopped
 
 
+def test_handshake_and_partial_window_samples_cannot_reject_a_fast_trial():
+    control = AdaptiveUploadWindow(4, 4, 8, 8)
+    samples(control, 3000)
+    assert (control.workers, control.depth) == (8, 4)
+    # Reproduce the supplied log: four sequential handshakes occupy most of
+    # the first trial interval. It is not a measurement of eight ready sockets.
+    samples(control, 1200, settled=False)
+    assert control.level == 1 and not control.stopped
+    assert control.samples == [] and control.baseline == 3000
+    samples(control, 5500)
+    assert (control.workers, control.depth) == (8, 8)
+
+
+def test_errors_still_back_off_during_connection_warmup():
+    control = AdaptiveUploadWindow(4, 4, 8, 8)
+    samples(control, 3000)
+    control.observe(1200, True, True, congested=True, settled=False)
+    assert (control.workers, control.depth) == (4, 4)
+    assert control.stopped and control.reason == "retry/throttle backoff"
+
+
 @pytest.mark.parametrize("backlog,saturated", [(False, True), (True, False), (False, False)])
 def test_source_limited_or_idle_transfers_do_not_expand(backlog, saturated):
     control = AdaptiveUploadWindow(4, 4, 16, 8)

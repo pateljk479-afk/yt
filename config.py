@@ -34,10 +34,10 @@ MIN_FREE_DISK_BYTES = int(os.getenv("MIN_FREE_DISK_MB", "128")) * 1024 * 1024
 CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "4"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))
 MAX_CONCURRENT_TRANSMISSIONS = int(os.getenv("MAX_CONCURRENT_TRANSMISSIONS", "1"))
-UPLOAD_WORKERS = max(1, min(8, int(os.getenv("UPLOAD_WORKERS", "4"))))
+UPLOAD_WORKERS = max(1, min(8, int(os.getenv("UPLOAD_WORKERS", "8"))))
 # OrderedMediaSession serializes message numbering/encryption/socket writes,
 # while responses overlap. Keep enough chunks in flight to hide network RTT.
-UPLOAD_REQUESTS_PER_CONNECTION = max(1, min(8, int(os.getenv("UPLOAD_REQUESTS_PER_CONNECTION", "4"))))
+UPLOAD_REQUESTS_PER_CONNECTION = max(1, min(8, int(os.getenv("UPLOAD_REQUESTS_PER_CONNECTION", "8"))))
 UPLOAD_ADAPTIVE = os.getenv("UPLOAD_ADAPTIVE", "true").lower() in ("true", "1", "yes")
 UPLOAD_MAX_WORKERS = max(UPLOAD_WORKERS, min(8, int(os.getenv("UPLOAD_MAX_WORKERS", "8"))))
 UPLOAD_MAX_REQUESTS_PER_CONNECTION = max(UPLOAD_REQUESTS_PER_CONNECTION,
